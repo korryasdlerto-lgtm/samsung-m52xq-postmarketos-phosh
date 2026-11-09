@@ -1,0 +1,10 @@
+#!/bin/sh
+# postmarketos-mkinitfs's 00-initramfs-base.files lists losetup at a /usr path.
+# Old (non merged-usr) util-linux shipped it only under /usr/sbin, so a compat link was needed.
+# With merged /usr (/usr/sbin -> bin) /usr/bin/losetup already is the real binary: an unconditional
+# "ln -sf" there replaced it by a link to itself (mkinitfs: "too many links"). Link only when missing,
+# and never when both paths are the same directory.
+if [ ! -e /usr/bin/losetup ] && [ -e /usr/sbin/losetup ] && [ ! /usr/sbin -ef /usr/bin ]; then
+	ln -s /usr/sbin/losetup /usr/bin/losetup
+fi
+exit 0

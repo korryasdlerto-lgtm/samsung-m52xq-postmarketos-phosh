@@ -1,0 +1,6 @@
+Files put into the image but not stored in this repository (binaries):
+
+usr/lib/modules/7.1.13/  — 23 kernel modules of build #444 and the depmod files; list: ../kernel/modules-7.1.13-444.txt;
+                           files: modules tarball of release kernel-7.1.13 (samsung-m52xq-ubuntu-lomiri).
+
+No other overlay files yet.
