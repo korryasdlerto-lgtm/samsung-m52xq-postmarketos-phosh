@@ -16,7 +16,7 @@ Document version: 2026-11-09. State: **first root image built, not booted on the
 
 | Feature | State | Notes |
 |---|---|---|
-| Root image | built | pmOS edge, systemd, Phosh, our device package r7, 7.1.13 #444 modules |
+| Root image | built | pmOS edge, systemd, Phosh, our device package r6 (losetup fixed by hand, see section 4), 7.1.13 #444 modules |
 | Boot, shell, display, touch | not tested | |
 | Calls, SMS, mobile data | not tested | stock calls, chatty, ModemManager 1.25.95 in the image |
 | Wi-Fi, Bluetooth, audio, camera, GPS, suspend | not tested | the m52xq fixes of the Plasma and Lomiri ports are not ported yet |
@@ -27,7 +27,7 @@ Document version: 2026-11-09. State: **first root image built, not booted on the
   (`mobile-config-firefox`), `gnome-contacts`, `gnome-clocks`, `gnome-maps`, `gnome-weather`, `gnome-calendar`, `gnome-console`,
   `nautilus`, `snapshot` (camera), `loupe`, `papers`, `showtime`, `decibels`, `g4music`, `flatpak`, `cups` and more.
   Full list of requested packages: `image/world.txt`.
-- `device-samsung-m52xq-1-r7` (`device-pkg/`).
+- `device-samsung-m52xq-1-r6` with `losetup` restored by `apk fix losetup` (`/usr/bin/losetup` is a plain file). The next build installs r7 (`device-pkg/`).
 - `/usr/lib/modules/7.1.13`: the 23 modules of kernel #444 (`kernel/modules-7.1.13-444.txt`) plus `depmod`.
 - User `user`, password `1111`; sshd enabled; nftables firewall enabled.
 
@@ -54,6 +54,8 @@ The link is now made only when `/usr/bin/losetup` is missing and `/usr/sbin` is 
 (r6 was installed), `apk fix losetup` restores the binary.
 
 ## 5. Building the image
+
+Every command step by step, with its output and the traps (Russian): `docs/ИНСТРУКЦИЯ.md`.
 
 The build uses a pmbootstrap work directory of its own, so the work directories of the Plasma and Lomiri ports are not touched.
 Script: `image/build-rootfs.sh`; config: `image/pmbootstrap-phosh.cfg`.

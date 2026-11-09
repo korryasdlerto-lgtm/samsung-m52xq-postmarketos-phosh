@@ -16,7 +16,7 @@
 
 | Функция | Состояние | Примечание |
 |---|---|---|
-| Образ корня | собран | pmOS edge, systemd, Phosh, наш пакет устройства r7, модули 7.1.13 #444 |
+| Образ корня | собран | pmOS edge, systemd, Phosh, наш пакет устройства r6 (losetup исправлен вручную, см. раздел 4), модули 7.1.13 #444 |
 | Загрузка, оболочка, экран, касания | не проверено | |
 | Звонки, SMS, мобильный интернет | не проверено | в образе стоковые calls, chatty, ModemManager 1.25.95 |
 | Wi-Fi, Bluetooth, звук, камера, GPS, сон | не проверено | правки m52xq из портов Plasma и Lomiri ещё не перенесены |
@@ -27,7 +27,7 @@
   (`mobile-config-firefox`), `gnome-contacts`, `gnome-clocks`, `gnome-maps`, `gnome-weather`, `gnome-calendar`, `gnome-console`,
   `nautilus`, `snapshot` (камера), `loupe`, `papers`, `showtime`, `decibels`, `g4music`, `flatpak`, `cups` и др.
   Полный список заказанных пакетов: `image/world.txt`.
-- `device-samsung-m52xq-1-r7` (`device-pkg/`).
+- `device-samsung-m52xq-1-r6` с восстановленным `apk fix losetup` (`/usr/bin/losetup` — обычный файл). Следующая сборка ставит r7 (`device-pkg/`).
 - `/usr/lib/modules/7.1.13`: 23 модуля ядра #444 (`kernel/modules-7.1.13-444.txt`) и `depmod`.
 - Пользователь `user`, пароль `1111`; sshd включён; файрвол nftables включён.
 
@@ -53,6 +53,8 @@ unable to add "/usr/sbin/losetup": EvalSymlinks: too many links
 бинарник возвращает `apk fix losetup`.
 
 ## 5. Сборка образа
+
+Все команды по шагам, с выводом и ловушками: `docs/ИНСТРУКЦИЯ.md`.
 
 Сборка идёт в отдельном рабочем каталоге pmbootstrap, чтобы не тронуть рабочие каталоги портов Plasma и Lomiri.
 Скрипт: `image/build-rootfs.sh`; конфиг: `image/pmbootstrap-phosh.cfg`.

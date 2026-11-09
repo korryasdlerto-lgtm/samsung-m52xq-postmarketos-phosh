@@ -19,7 +19,7 @@ others) are not in it yet; they will be added one by one, each tested on the pho
 | English | [docs/MANUAL-EN.md](docs/MANUAL-EN.md) |
 | Русский | [docs/MANUAL-RU.md](docs/MANUAL-RU.md) |
 
-Plus the work log with every command (Russian): [docs/ЖУРНАЛ-PHOSH.md](docs/ЖУРНАЛ-PHOSH.md).
+Step-by-step build guide with every command and its result (Russian): [docs/ИНСТРУКЦИЯ.md](docs/ИНСТРУКЦИЯ.md); work log: [docs/ЖУРНАЛ-PHOSH.md](docs/ЖУРНАЛ-PHOSH.md).
 
 ## Kernel
 
@@ -40,11 +40,11 @@ The modules in the image: [kernel/modules-7.1.13-444.txt](kernel/modules-7.1.13-
 
 | Folder | Contents |
 |---|---|
-| `image/` | build script, pmbootstrap config, package list (`world.txt`), repositories |
+| `image/` | build script, pmbootstrap config, package list (`world.txt`), repositories, `local-repo/` (device package r7 and the kernel placeholder apk, SHA256SUMS, public key) |
 | `device-pkg/` | `device-samsung-m52xq` (pmaports `device/testing`), r7 |
 | `kernel/` | kernel notes, list of the modules in the image |
 | `installer/` | TWRP installer (not written yet) |
 | `rootfs-overlay/` | files put over the image (none yet); binaries listed in `EXCLUDED-FILES.txt` |
-| `docs/` | manuals (EN/RU), work log, package list |
+| `docs/` | manuals (EN/RU), step-by-step guide, work log, package list |
 
 The system image is not in the repository (it is a built system); see the manual, section 5.
