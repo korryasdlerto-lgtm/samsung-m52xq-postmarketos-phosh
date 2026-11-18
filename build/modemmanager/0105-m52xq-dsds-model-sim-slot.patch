@@ -1,0 +1,30 @@
+diff --git a/src/mm-shared-qmi.c b/src/mm-shared-qmi.c
+index cd69315..4675800 100644
+--- a/src/mm-shared-qmi.c
++++ b/src/mm-shared-qmi.c
+@@ -1216,6 +1216,25 @@ mm_shared_qmi_load_model (MMIfaceModem *self,
+ {
+     QmiClient *client = NULL;
+ 
++    /* m52xq DSDS: every SIM has its own modem object on the same QRTR node, and the DMS model is the
++     * same for both ("241"), so the apps (GNOME Calls, the shell) listed two identical modems. With
++     * MM_QRTR_DSDS / MM_QRTR_SIM_ONLY the model names the SIM slot of the object's QMI subscription. */
++    if ((g_getenv ("MM_QRTR_DSDS") || g_getenv ("MM_QRTR_SIM_ONLY")) && MM_IS_BROADBAND_MODEM_QMI (self)) {
++        MMPortQmi *port;
++
++        port = mm_broadband_modem_qmi_peek_port_qmi (MM_BROADBAND_MODEM_QMI (self));
++        if (port) {
++            GTask *task;
++
++            task = g_task_new (self, NULL, callback, user_data);
++            g_task_return_pointer (task,
++                                   g_strdup_printf ("SIM %u", mm_port_qmi_get_subscription (port) + 1),
++                                   g_free);
++            g_object_unref (task);
++            return;
++        }
++    }
++
+     if (!mm_shared_qmi_ensure_client (MM_SHARED_QMI (self),
+                                       QMI_SERVICE_DMS, &client,
+                                       callback, user_data))

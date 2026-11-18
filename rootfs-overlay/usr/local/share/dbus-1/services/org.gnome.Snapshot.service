@@ -1,0 +1,7 @@
+[D-BUS Service]
+Name=org.gnome.Snapshot
+# m52xq: Snapshot crashes (SIGSEGV in gsk_renderer_render_texture, "gdk_gl_context_make_current() failed") on the second
+# picture when its window is drawn on the GPU (GSK vulkan and ngl alike); with the cairo renderer it is stable (2026-11-13)
+# m52xq (2026-11-16): GDK_DISABLE=gl too — with GL the turn of the display (phoc modeset) made gdk_gl_context_make_current()
+# fail and Snapshot aborted (epoxy: no eglCreateImageKHR)
+Exec=/usr/bin/env GSK_RENDERER=cairo GDK_DISABLE=gl GST_PLUGIN_FEATURE_RANK=v4l2h264dec:0 /usr/bin/snapshot --gapplication-service

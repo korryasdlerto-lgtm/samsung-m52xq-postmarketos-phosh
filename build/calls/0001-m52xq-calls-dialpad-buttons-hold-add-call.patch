@@ -1,0 +1,699 @@
+diff -ruN '--exclude=.git' '--exclude=output' a/plugins/provider/mm/calls-mm-call.c b/plugins/provider/mm/calls-mm-call.c
+--- a/plugins/provider/mm/calls-mm-call.c	2026-10-12 21:00:27.000000000 +0300
++++ b/plugins/provider/mm/calls-mm-call.c	2026-11-12 02:19:39.129321467 +0200
+@@ -246,6 +246,46 @@
+ DEFINE_OPERATION (start, calls_mm_call_start_call, "starting outgoing call");
+ 
+ 
++/*
++ * m52xq: hold / resume through the HoldAndAccept of the modem's Voice interface (tested on the M52: with one active call it puts
++ * it on hold, with one held call it resumes it; the voice path of m52xq-voicecall follows the call state). The modem of the call
++ * is set by the origin ("m52xq-voice").
++ */
++static void
++hold_and_accept_cb (MMModemVoice *voice,
++                    GAsyncResult *res,
++                    CallsMMCall  *self)
++{
++  g_autoptr (GError) error = NULL;
++
++  if (!mm_modem_voice_hold_and_accept_finish (voice, res, &error)) {
++    g_warning ("Error holding / resuming MM call: %s", error->message);
++    CALLS_ERROR (self, error);
++  }
++
++  g_object_unref (self);
++}
++
++static void
++calls_mm_call_hold (CallsCall *call, gboolean hold)
++{
++  CallsMMCall *self = CALLS_MM_CALL (call);
++  MMModemVoice *voice = g_object_get_data (G_OBJECT (self), "m52xq-voice");
++  CallsCallState state = calls_call_get_state (call);
++
++  if (!voice) {
++    g_warning ("MM call without a modem voice interface, cannot hold");
++    return;
++  }
++
++  /* HoldAndAccept toggles: only act when the call is in the state the button wants to leave */
++  if (hold ? state != CALLS_CALL_STATE_ACTIVE : state != CALLS_CALL_STATE_HELD)
++    return;
++
++  mm_modem_voice_hold_and_accept (voice, NULL, (GAsyncReadyCallback) hold_and_accept_cb, g_object_ref (self));
++}
++
++
+ static void
+ calls_mm_call_send_dtmf_tone (CallsCall *call, char key)
+ {
+@@ -373,6 +413,7 @@
+   call_class->answer = calls_mm_call_answer;
+   call_class->hang_up = calls_mm_call_hang_up;
+   call_class->send_dtmf_tone = calls_mm_call_send_dtmf_tone;
++  call_class->hold = calls_mm_call_hold;
+ 
+   props[PROP_MM_CALL] = g_param_spec_object ("mm-call",
+                                              "MM call",
+diff -ruN '--exclude=.git' '--exclude=output' a/plugins/provider/mm/calls-mm-origin.c b/plugins/provider/mm/calls-mm-origin.c
+--- a/plugins/provider/mm/calls-mm-origin.c	2026-10-12 21:00:27.000000000 +0300
++++ b/plugins/provider/mm/calls-mm-origin.c	2026-11-12 02:19:39.129321467 +0200
+@@ -473,6 +473,9 @@
+   char *path;
+ 
+   call = calls_mm_call_new (mm_call);
++  /* m52xq: the modem of the call, used to hold / resume it */
++  if (self->voice)
++    g_object_set_data_full (G_OBJECT (call), "m52xq-voice", g_object_ref (self->voice), g_object_unref);
+ 
+   g_signal_connect (call, "notify::state",
+                     G_CALLBACK (call_state_changed_cb),
+@@ -494,7 +497,8 @@
+   /* FIXME: Hang up the call, since accepting a secondary call does not currently work.
+    * CallsMMCall[28822]: WARNING: Error accepting ModemManager call to `+4916XXXXXXXX': GDBus.Error:org.freedesktop.ModemManager1.Error.Core.Failed: This call was not ringing, cannot accept
+    */
+-  if (g_hash_table_size (self->calls) > 1)
++  /* m52xq: only a second INCOMING call is rejected; a second outgoing call (Add call, the first one is on hold) stays */
++  if (g_hash_table_size (self->calls) > 1 && calls_call_get_inbound (CALLS_CALL (call)))
+     calls_call_hang_up (CALLS_CALL (call));
+ }
+ 
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-application.c b/src/calls-application.c
+--- a/src/calls-application.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-application.c	2026-11-12 02:19:39.129321467 +0200
+@@ -418,6 +418,21 @@
+   calls_main_window_show_accounts_overview (app->main_window);
+ }
+ 
++/* m52xq: "Add call" on the call screen: show the main window with the dial pad */
++static void
++show_dial_pad (GSimpleAction *action,
++               GVariant      *parameter,
++               gpointer       user_data)
++{
++  CallsApplication *app = CALLS_APPLICATION (user_data);
++
++  if (!app->main_window)
++    return;
++
++  calls_main_window_show_dial_pad (app->main_window);
++  gtk_window_present (GTK_WINDOW (app->main_window));
++}
++
+ static void
+ manager_state_changed_cb (GApplication *application)
+ {
+@@ -437,6 +452,7 @@
+   { "copy-number", copy_number, "s" },
+   /* TODO About dialog { "about", show_about, NULL}, */
+   { "accounts", show_accounts, NULL },
++  { "show-dial-pad", show_dial_pad, NULL },
+ };
+ 
+ 
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-call.c b/src/calls-call.c
+--- a/src/calls-call.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-call.c	2026-11-12 02:19:39.125321554 +0200
+@@ -500,6 +500,37 @@
+ }
+ 
+ /**
++ * calls_call_get_can_hold:
++ * @self: a #CallsCall
++ *
++ * Returns: %TRUE if the call can be put on hold (m52xq)
++ */
++gboolean
++calls_call_get_can_hold (CallsCall *self)
++{
++  g_return_val_if_fail (CALLS_IS_CALL (self), FALSE);
++
++  return CALLS_CALL_GET_CLASS (self)->hold != NULL;
++}
++
++/**
++ * calls_call_hold:
++ * @self: a #CallsCall
++ * @hold: %TRUE to put the call on hold, %FALSE to resume it
++ *
++ * m52xq: hold / resume the call.
++ */
++void
++calls_call_hold (CallsCall *self,
++                 gboolean   hold)
++{
++  g_return_if_fail (CALLS_IS_CALL (self));
++
++  if (CALLS_CALL_GET_CLASS (self)->hold)
++    CALLS_CALL_GET_CLASS (self)->hold (self, hold);
++}
++
++/**
+  * calls_call_hang_up:
+  * @self: a #CallsCall
+  *
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-call.h b/src/calls-call.h
+--- a/src/calls-call.h	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-call.h	2026-11-12 02:19:39.125321554 +0200
+@@ -70,6 +70,9 @@
+   void         (*hang_up)              (CallsCall *self);
+   void         (*send_dtmf_tone)       (CallsCall *self,
+                                         char       key);
++  /* m52xq: optional; NULL = the call cannot be held */
++  void         (*hold)                 (CallsCall *self,
++                                        gboolean   hold);
+ };
+ 
+ const char    *calls_call_get_id                 (CallsCall *self);
+@@ -89,6 +92,9 @@
+ const char    *calls_call_get_protocol           (CallsCall *self);
+ void           calls_call_answer                 (CallsCall *self);
+ void           calls_call_hang_up                (CallsCall *self);
++gboolean       calls_call_get_can_hold           (CallsCall *self);
++void           calls_call_hold                   (CallsCall *self,
++                                                  gboolean   hold);
+ gboolean       calls_call_can_dtmf               (CallsCall *self);
+ void           calls_call_send_dtmf_tone         (CallsCall *self,
+                                                   char       key);
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-call-window.c b/src/calls-call-window.c
+--- a/src/calls-call-window.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-call-window.c	2026-11-12 02:19:39.129321467 +0200
+@@ -137,6 +137,20 @@
+ }
+ 
+ 
++/* m52xq: Add call: put the call on hold and show the dial pad */
++static void
++on_add_call (CallsCallWindow *self,
++             CuiCallDisplay  *display)
++{
++  CuiCall *call = cui_call_display_get_call (display);
++
++  if (call && cui_call_get_state (call) == CUI_CALL_STATE_ACTIVE && cui_call_get_can_hold (call))
++    cui_call_hold (call, TRUE);
++
++  g_action_group_activate_action (G_ACTION_GROUP (g_application_get_default ()), "show-dial-pad", NULL);
++}
++
++
+ static void
+ add_call_to_window (CallsCallWindow *self,
+                     CallsUiCallData *ui_call_data)
+@@ -149,6 +163,7 @@
+   g_assert (CUI_IS_CALL (call));
+ 
+   display = cui_call_display_new (CUI_CALL (ui_call_data));
++  g_signal_connect_swapped (display, "add-call", G_CALLBACK (on_add_call), self);
+   item = calls_call_selector_item_new (display);
+   gtk_stack_add_named (self->call_stack, GTK_WIDGET (display),
+                        cui_call_get_id (call));
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-main-window.c b/src/calls-main-window.c
+--- a/src/calls-main-window.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-main-window.c	2026-11-12 02:19:39.129321467 +0200
+@@ -506,6 +506,15 @@
+   }
+ }
+ 
++/* m52xq: Add call during a call */
++void
++calls_main_window_show_dial_pad (CallsMainWindow *self)
++{
++  g_return_if_fail (CALLS_IS_MAIN_WINDOW (self));
++
++  adw_view_stack_set_visible_child_name (self->main_stack, "dial-pad");
++}
++
+ void
+ calls_main_window_show_accounts_overview (CallsMainWindow *self)
+ {
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-main-window.h b/src/calls-main-window.h
+--- a/src/calls-main-window.h	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-main-window.h	2026-11-12 02:19:39.129321467 +0200
+@@ -38,6 +38,7 @@
+ void             calls_main_window_dial                     (CallsMainWindow *self,
+                                                              const gchar     *target);
+ void             calls_main_window_show_accounts_overview   (CallsMainWindow *self);
++void             calls_main_window_show_dial_pad            (CallsMainWindow *self);
+ 
+ G_END_DECLS
+ 
+diff -ruN '--exclude=.git' '--exclude=output' a/src/calls-ui-call-data.c b/src/calls-ui-call-data.c
+--- a/src/calls-ui-call-data.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-ui-call-data.c	2026-11-12 02:19:39.125321554 +0200
+@@ -215,6 +215,30 @@
+ }
+ 
+ 
++static gboolean
++calls_ui_call_data_get_can_hold (CuiCall *call_data)
++{
++  CallsUiCallData *self = (CallsUiCallData *) call_data;
++
++  g_return_val_if_fail (CALLS_IS_UI_CALL_DATA (self), FALSE);
++  g_return_val_if_fail (!!self->call, FALSE);
++
++  return calls_call_get_can_hold (self->call);
++}
++
++
++static void
++calls_ui_call_data_hold (CuiCall *call_data, gboolean hold)
++{
++  CallsUiCallData *self = (CallsUiCallData *) call_data;
++
++  g_return_if_fail (CALLS_IS_UI_CALL_DATA (self));
++  g_return_if_fail (!!self->call);
++
++  calls_call_hold (self->call, hold);
++}
++
++
+ static void
+ calls_ui_call_data_send_dtmf (CuiCall    *call_data,
+                               const char *dtmf)
+@@ -242,6 +266,8 @@
+   iface->accept = calls_ui_call_data_accept;
+   iface->hang_up = calls_ui_call_data_hang_up;
+   iface->send_dtmf = calls_ui_call_data_send_dtmf;
++  iface->get_can_hold = calls_ui_call_data_get_can_hold;
++  iface->hold = calls_ui_call_data_hold;
+ }
+ 
+ 
+diff -ruN '--exclude=.git' '--exclude=output' a/subprojects/libcall-ui/src/cui-call.c b/subprojects/libcall-ui/src/cui-call.c
+--- a/subprojects/libcall-ui/src/cui-call.c	2025-11-09 10:23:12.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call.c	2026-11-12 02:19:39.121321642 +0200
+@@ -262,6 +262,47 @@
+ }
+ 
+ /**
++ * cui_call_get_can_hold:
++ * @self: The call
++ *
++ * Returns: whether the call can be put on hold and resumed (m52xq)
++ */
++gboolean
++cui_call_get_can_hold (CuiCall *self)
++{
++  CuiCallInterface *iface;
++
++  g_return_val_if_fail (CUI_IS_CALL (self), FALSE);
++
++  iface = CUI_CALL_GET_IFACE (self);
++  if (!iface->get_can_hold || !iface->hold)
++    return FALSE;
++
++  return iface->get_can_hold (self);
++}
++
++/**
++ * cui_call_hold:
++ * @self: The call
++ * @hold: %TRUE to put the call on hold, %FALSE to resume it
++ *
++ * m52xq: put an active call on hold or resume a held one.
++ */
++void
++cui_call_hold (CuiCall *self, gboolean hold)
++{
++  CuiCallInterface *iface;
++
++  g_return_if_fail (CUI_IS_CALL (self));
++
++  iface = CUI_CALL_GET_IFACE (self);
++  if (!iface->hold)
++    return;
++
++  iface->hold (self, hold);
++}
++
++/**
+  * cui_call_accept:
+  * @self: The call
+  *
+diff -ruN '--exclude=.git' '--exclude=output' a/subprojects/libcall-ui/src/cui-call-display.c b/subprojects/libcall-ui/src/cui-call-display.c
+--- a/subprojects/libcall-ui/src/cui-call-display.c	2025-11-09 10:23:12.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call-display.c	2026-11-12 02:19:39.125321554 +0200
+@@ -43,6 +43,9 @@
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+ 
++/* m52xq: "add-call" is emitted by the Add call button */
++static guint m52xq_signals[1];
++
+ struct _CuiCallDisplay {
+   AdwBin                  parent_instance;
+ 
+@@ -60,6 +63,8 @@
+   GtkBox                 *general_controls;
+   GtkToggleButton        *speaker;
+   GtkToggleButton        *mute;
++  GtkToggleButton        *hold;      /* m52xq */
++  GtkButton              *add_call;  /* m52xq */
+   GtkButton              *hang_up;
+   GtkButton              *answer;
+   CuiEncryptionIndicator *encryption_indicator;
+@@ -122,12 +127,55 @@
+ }
+ 
+ 
++static void m52xq_toggle_style (GtkToggleButton *button, const char *icon_on, const char *icon_off);
++
++/* m52xq: Hold puts the call on hold / resumes it (HoldAndAccept of the modem, through the CuiCall implementation) */
+ static void
+ hold_toggled_cb (GtkToggleButton *togglebutton,
+                  CuiCallDisplay  *self)
+ {
++  m52xq_toggle_style (togglebutton, NULL, NULL);
++
++  if (!self->call)
++    return;
++
++  cui_call_hold (self->call, gtk_toggle_button_get_active (togglebutton));
++}
++
++
++/* m52xq: the mute / speaker toggles show their state clearly (accent colour; mute also changes its icon):
++ * on the green call screen of the lock screen the checked style was invisible */
++static void
++m52xq_toggle_style (GtkToggleButton *button, const char *icon_on, const char *icon_off)
++{
++  gboolean on = gtk_toggle_button_get_active (button);
++  GtkWidget *child = gtk_button_get_child (GTK_BUTTON (button));
++
++  if (on)
++    gtk_widget_add_css_class (GTK_WIDGET (button), "suggested-action");
++  else
++    gtk_widget_remove_css_class (GTK_WIDGET (button), "suggested-action");
++  if (icon_on && GTK_IS_IMAGE (child))
++    gtk_image_set_from_icon_name (GTK_IMAGE (child), on ? icon_on : icon_off);
+ }
+ 
++#define M52XQ_MUTE_ICONS "microphone-sensitivity-muted-symbolic", "audio-input-microphone-symbolic"
++
++/* m52xq: the Hold toggle follows the state of the call, Hold and Add call work for active / held calls that can be held */
++static void
++m52xq_sync_hold (CuiCallDisplay *self, CuiCallState state)
++{
++  gboolean can_hold = self->call && cui_call_get_can_hold (self->call);
++  gboolean holdable = can_hold && (state == CUI_CALL_STATE_ACTIVE || state == CUI_CALL_STATE_HELD);
++
++  gtk_widget_set_sensitive (GTK_WIDGET (self->hold), holdable);
++  gtk_widget_set_sensitive (GTK_WIDGET (self->add_call), holdable);
++
++  g_signal_handlers_block_by_func (self->hold, hold_toggled_cb, self);
++  gtk_toggle_button_set_active (self->hold, state == CUI_CALL_STATE_HELD);
++  m52xq_toggle_style (self->hold, NULL, NULL);
++  g_signal_handlers_unblock_by_func (self->hold, hold_toggled_cb, self);
++}
+ 
+ static void
+ mute_toggled_cb (GtkToggleButton *togglebutton,
+@@ -136,6 +184,7 @@
+   gboolean want_mute;
+ 
+   want_mute = gtk_toggle_button_get_active (togglebutton);
++  m52xq_toggle_style (togglebutton, M52XQ_MUTE_ICONS);
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   call_audio_mute_mic_async (want_mute, on_libcallaudio_async_finished, NULL);
+ G_GNUC_END_IGNORE_DEPRECATIONS
+@@ -149,16 +198,19 @@
+   gboolean want_speaker;
+ 
+   want_speaker = gtk_toggle_button_get_active (togglebutton);
++  m52xq_toggle_style (togglebutton, NULL, NULL);
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   call_audio_enable_speaker_async (want_speaker, on_libcallaudio_async_finished, NULL);
+ G_GNUC_END_IGNORE_DEPRECATIONS
+ }
+ 
+ 
++/* m52xq: the application puts the call on hold and shows its dial pad */
+ static void
+ add_call_clicked_cb (GtkButton      *button,
+                      CuiCallDisplay *self)
+ {
++  g_signal_emit (self, m52xq_signals[0], 0);
+ }
+ 
+ 
+@@ -232,6 +284,8 @@
+       (GTK_WIDGET (self->gsm_controls),
+       state != CUI_CALL_STATE_CALLING);
+ 
++    m52xq_sync_hold (self, state);
++
+     /* TODO: remove CUI_CALL_TYPE_UNKNOWN when all library users are recent enough */
+     if (cui_call_get_call_type(call) == CUI_CALL_TYPE_CELLULAR ||
+         cui_call_get_call_type(call) == CUI_CALL_TYPE_UNKNOWN) {
+@@ -500,6 +554,14 @@
+   object_class->dispose = cui_call_display_dispose;
+ 
+   /**
++   * CuiCallDisplay::add-call:
++   *
++   * The Add call button was pressed (m52xq).
++   */
++  m52xq_signals[0] = g_signal_new ("add-call", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++                                   0, NULL, NULL, NULL, G_TYPE_NONE, 0);
++
++  /**
+    * CuiCallDisplay:call:
+    *
+    * An opaque handle to a call
+@@ -524,6 +586,8 @@
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, general_controls);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, gsm_controls);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, hang_up);
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, hold);
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, add_call);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, keypad_entry);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, mute);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, primary_contact_info);
+@@ -548,6 +612,10 @@
+ cui_call_display_init (CuiCallDisplay *self)
+ {
+   gtk_widget_init_template (GTK_WIDGET (self));
++  /* m52xq: initial look of the toggles */
++  m52xq_toggle_style (self->mute, M52XQ_MUTE_ICONS);
++  m52xq_toggle_style (self->speaker, NULL, NULL);
++  m52xq_toggle_style (self->hold, NULL, NULL);
+ 
+   g_signal_connect (gtk_editable_get_delegate (GTK_EDITABLE (self->keypad_entry)),
+                             "insert-text",
+diff -ruN '--exclude=.git' '--exclude=output' a/subprojects/libcall-ui/src/cui-call.h b/subprojects/libcall-ui/src/cui-call.h
+--- a/subprojects/libcall-ui/src/cui-call.h	2025-11-09 10:23:12.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call.h	2026-11-12 02:19:39.121321642 +0200
+@@ -70,6 +70,10 @@
+   void           (*accept)                 (CuiCall *self);
+   void           (*hang_up)                (CuiCall *self);
+   void           (*send_dtmf)              (CuiCall *self, const gchar *dtmf);
++
++  /* m52xq: hold / resume of cellular calls (both optional) */
++  gboolean       (*get_can_hold)           (CuiCall *self);
++  void           (*hold)                   (CuiCall *self, gboolean hold);
+ };
+ 
+ GdkPaintable *cui_call_get_avatar_icon  (CuiCall *self);
+@@ -81,6 +85,9 @@
+ gboolean      cui_call_get_can_dtmf     (CuiCall *self);
+ gdouble       cui_call_get_active_time  (CuiCall *self);
+ 
++gboolean      cui_call_get_can_hold     (CuiCall *self);
++void          cui_call_hold             (CuiCall *self, gboolean hold);
++
+ void          cui_call_accept           (CuiCall *self);
+ void          cui_call_hang_up          (CuiCall *self);
+ void          cui_call_send_dtmf (CuiCall *self, const gchar *dtmf);
+diff -ruN '--exclude=.git' '--exclude=output' a/subprojects/libcall-ui/src/cui-dialpad.c b/subprojects/libcall-ui/src/cui-dialpad.c
+--- a/subprojects/libcall-ui/src/cui-dialpad.c	2025-11-09 10:23:12.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-dialpad.c	2026-11-12 01:42:50.677667329 +0200
+@@ -46,10 +46,16 @@
+   AdwBin               parent_instance;
+ 
+   AdwClamp            *clamp;
++  GtkGrid             *grid;
+   GtkEntry            *keypad_entry;
+   CuiKeypad           *keypad;
+   GtkButton           *dial;
+   GtkButton           *backspace;
++  GtkWidget           *control_box;
++
++  /* m52xq: landscape layout (number and call button on the left, digits on the right) */
++  gboolean             landscape;
++  guint                layout_idle_id;
+ };
+ 
+ G_DEFINE_TYPE (CuiDialpad, cui_dialpad, ADW_TYPE_BIN);
+@@ -121,11 +127,103 @@
+ }
+ 
+ 
++/* m52xq: in a landscape window the portrait column (number, 4 rows of keys, call button) does not fit the height
++ * of a phone screen and had to be scrolled. There the number and the call/backspace buttons go to a left column
++ * and the keys to the right; the portrait layout is unchanged. Decided on the window size, as the dialpad itself
++ * lives in a scrolled window and always gets its natural height. */
++static void
++apply_layout (CuiDialpad *self)
++{
++  GtkWidget *entry = GTK_WIDGET (self->keypad_entry);
++  GtkWidget *keypad = GTK_WIDGET (self->keypad);
++  GtkWidget *control = self->control_box;
++
++  g_object_ref (entry);
++  g_object_ref (keypad);
++  g_object_ref (control);
++  gtk_grid_remove (self->grid, entry);
++  gtk_grid_remove (self->grid, keypad);
++  gtk_grid_remove (self->grid, control);
++
++  if (self->landscape) {
++    gtk_grid_attach (self->grid, entry, 0, 0, 1, 1);
++    gtk_grid_attach (self->grid, control, 0, 1, 1, 1);
++    gtk_grid_attach (self->grid, keypad, 1, 0, 1, 2);
++    gtk_widget_set_valign (entry, GTK_ALIGN_END);
++    gtk_widget_set_valign (control, GTK_ALIGN_START);
++    gtk_widget_set_margin_top (control, 12);
++    gtk_widget_set_margin_top (keypad, 0);
++    gtk_widget_set_margin_bottom (keypad, 0);
++    gtk_widget_set_margin_start (keypad, 24);
++    g_object_set (keypad, "row-spacing", 4, NULL);
++    gtk_widget_set_margin_top (GTK_WIDGET (self->grid), 4);
++    gtk_widget_set_margin_bottom (GTK_WIDGET (self->grid), 4);
++    adw_clamp_set_maximum_size (self->clamp, 640);
++  } else {
++    gtk_grid_attach (self->grid, entry, 0, 0, 1, 1);
++    gtk_grid_attach (self->grid, keypad, 0, 1, 1, 1);
++    gtk_grid_attach (self->grid, control, 0, 2, 1, 1);
++    gtk_widget_set_valign (entry, GTK_ALIGN_FILL);
++    gtk_widget_set_valign (control, GTK_ALIGN_FILL);
++    gtk_widget_set_margin_top (control, 0);
++    gtk_widget_set_margin_top (keypad, 18);
++    gtk_widget_set_margin_bottom (keypad, 18);
++    gtk_widget_set_margin_start (keypad, 0);
++    g_object_set (keypad, "row-spacing", 10, NULL);
++    gtk_widget_set_margin_top (GTK_WIDGET (self->grid), 16);
++    gtk_widget_set_margin_bottom (GTK_WIDGET (self->grid), 16);
++    adw_clamp_set_maximum_size (self->clamp, 300);
++  }
++
++  g_object_unref (entry);
++  g_object_unref (keypad);
++  g_object_unref (control);
++}
++
++
++static gboolean
++layout_idle_cb (gpointer user_data)
++{
++  CuiDialpad *self = CUI_DIALPAD (user_data);
++
++  self->layout_idle_id = 0;
++  apply_layout (self);
++  return G_SOURCE_REMOVE;
++}
++
++
++static void
++cui_dialpad_size_allocate (GtkWidget *widget,
++                           int        width,
++                           int        height,
++                           int        baseline)
++{
++  CuiDialpad *self = CUI_DIALPAD (widget);
++  GtkRoot *root = gtk_widget_get_root (widget);
++
++  GTK_WIDGET_CLASS (cui_dialpad_parent_class)->size_allocate (widget, width, height, baseline);
++
++  if (root) {
++    int w = gtk_widget_get_width (GTK_WIDGET (root));
++    int h = gtk_widget_get_height (GTK_WIDGET (root));
++    gboolean landscape = w > h && h > 0 && h < 600;
++
++    if (landscape != self->landscape) {
++      self->landscape = landscape;
++      if (!self->layout_idle_id)
++        self->layout_idle_id = g_idle_add (layout_idle_cb, self);
++    }
++  }
++}
++
++
+ static void
+ cui_dialpad_dispose (GObject *object)
+ {
+   CuiDialpad *self = CUI_DIALPAD (object);
+ 
++  g_clear_handle_id (&self->layout_idle_id, g_source_remove);
++
+   GtkWidget *clamp = GTK_WIDGET (self->clamp);
+   g_clear_pointer (&clamp, gtk_widget_unparent);
+ 
+@@ -143,6 +241,7 @@
+   object_class->set_property = cui_dialpad_set_property;
+ 
+   object_class->dispose = cui_dialpad_dispose;
++  widget_class->size_allocate = cui_dialpad_size_allocate;
+ 
+   signals[DIALED] =
+     g_signal_new ("dialed",
+@@ -171,6 +270,8 @@
+   gtk_widget_class_set_template_from_resource (widget_class, "/org/gnome/CallUI/ui/cui-dialpad.ui");
+ 
+   gtk_widget_class_bind_template_child (widget_class, CuiDialpad, clamp);
++  gtk_widget_class_bind_template_child (widget_class, CuiDialpad, grid);
++  gtk_widget_class_bind_template_child (widget_class, CuiDialpad, control_box);
+   gtk_widget_class_bind_template_child (widget_class, CuiDialpad, keypad);
+   gtk_widget_class_bind_template_child (widget_class, CuiDialpad, keypad_entry);
+   gtk_widget_class_bind_template_child (widget_class, CuiDialpad, dial);
+diff -ruN '--exclude=.git' '--exclude=output' a/subprojects/libcall-ui/src/cui-dialpad.ui b/subprojects/libcall-ui/src/cui-dialpad.ui
+--- a/subprojects/libcall-ui/src/cui-dialpad.ui	2025-11-09 10:23:12.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-dialpad.ui	2026-11-12 01:42:50.677667329 +0200
+@@ -7,12 +7,11 @@
+       <object class="AdwClamp" id="clamp">
+         <property name="maximum-size">300</property>
+         <child>
+-          <object class="GtkBox">
++          <object class="GtkGrid" id="grid">
+             <property name="margin-start">24</property>
+             <property name="margin-end">24</property>
+             <property name="margin-top">16</property>
+             <property name="margin-bottom">16</property>
+-            <property name="orientation">vertical</property>
+             <child>
+               <object class="GtkEntry" id="keypad_entry">
+                 <property name="hexpand">True</property>
+@@ -23,6 +22,10 @@
+                 <style>
+                   <class name="phone-number-entry"/>
+                 </style>
++                <layout>
++                  <property name="column">0</property>
++                  <property name="row">0</property>
++                </layout>
+               </object>
+             </child>
+             <child>
+@@ -33,6 +36,10 @@
+                 <property name="row-spacing">10</property>
+                 <property name="column-spacing">16</property>
+                 <property name="entry">keypad_entry</property>
++                <layout>
++                  <property name="column">0</property>
++                  <property name="row">1</property>
++                </layout>
+               </object>
+             </child>
+             <child>
+@@ -73,6 +80,10 @@
+                     </style>
+                   </object>
+                 </child>
++                <layout>
++                  <property name="column">0</property>
++                  <property name="row">2</property>
++                </layout>
+               </object>
+             </child>
+           </object>

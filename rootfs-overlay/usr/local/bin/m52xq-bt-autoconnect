@@ -1,0 +1,70 @@
+#!/usr/bin/python3 -B
+# m52xq (2026-11-17): when Bluetooth is switched on, connect the paired + trusted audio devices (headphones, speakers),
+# as Android does. BlueZ reconnects by itself only after a link loss; after Bluetooth off/on the YD05 headphones stayed
+# disconnected and the sound stayed on the speaker. Devices that are not around just fail (no retries, no CPU while idle).
+import sys
+import time
+from gi.repository import Gio, GLib
+
+BLUEZ = 'org.bluez'
+AUDIO_UUIDS = {
+    '0000110b-0000-1000-8000-00805f9b34fb',  # A2DP sink
+    '0000111e-0000-1000-8000-00805f9b34fb',  # Hands-Free
+    '00001108-0000-1000-8000-00805f9b34fb',  # Headset
+}
+bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+pending = {'id': 0}
+
+
+def log(msg):
+    print('m52xq-bt-autoconnect: ' + msg, flush=True)
+
+
+def objects():
+    reply = bus.call_sync(BLUEZ, '/', 'org.freedesktop.DBus.ObjectManager', 'GetManagedObjects', None, None,
+                          Gio.DBusCallFlags.NONE, 5000, None)
+    return reply.unpack()[0]
+
+
+def on_connected(proxy, res, addr):
+    try:
+        bus.call_finish(res)
+        log('%s connected' % addr)
+    except GLib.Error as e:
+        log('%s: %s' % (addr, e.message))
+
+
+def connect_audio():
+    pending['id'] = 0
+    try:
+        objs = objects()
+    except GLib.Error as e:
+        log('bluez: %s' % e.message)
+        return False
+    for path, ifaces in objs.items():
+        dev = ifaces.get('org.bluez.Device1')
+        if not dev or not dev.get('Paired') or not dev.get('Trusted') or dev.get('Blocked') or dev.get('Connected'):
+            continue
+        if not AUDIO_UUIDS & set(u.lower() for u in dev.get('UUIDs', [])):
+            continue
+        addr = dev.get('Address', path)
+        log('Bluetooth on: connecting %s (%s)' % (dev.get('Alias', ''), addr))
+        bus.call(BLUEZ, path, 'org.bluez.Device1', 'Connect', None, None, Gio.DBusCallFlags.NONE, 30000, None,
+                 on_connected, addr)
+    return False
+
+
+def on_props(conn, sender, path, iface, signal, params):
+    changed_iface, changed, _ = params.unpack()
+    if changed_iface != 'org.bluez.Adapter1' or changed.get('Powered') is not True:
+        return
+    # give the adapter and the profiles a moment after power-on
+    if pending['id']:
+        GLib.source_remove(pending['id'])
+    pending['id'] = GLib.timeout_add_seconds(2, connect_audio)
+
+
+bus.signal_subscribe(BLUEZ, 'org.freedesktop.DBus.Properties', 'PropertiesChanged', None, None,
+                     Gio.DBusSignalFlags.NONE, on_props)
+log('watching Bluetooth power-on')
+GLib.MainLoop().run()

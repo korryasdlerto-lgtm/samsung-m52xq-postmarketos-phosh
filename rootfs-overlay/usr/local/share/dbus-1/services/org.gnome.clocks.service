@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.gnome.clocks
+# m52xq: gnome-clocks crashed (SIGSEGV after "gdk_gl_context_make_current() failed") when it showed a ringing alarm after a
+# resume; with the cairo renderer of GTK it does not use GL at all (as Snapshot, 2026-11-14)
+Exec=/usr/bin/env GSK_RENDERER=cairo /usr/bin/gnome-clocks --gapplication-service

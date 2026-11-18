@@ -1,0 +1,17 @@
+--- a/src/calls-call-window.c	2026-11-12 21:25:26.405577316 +0200
++++ b/src/calls-call-window.c	2026-11-12 21:25:26.421577488 +0200
+@@ -238,6 +238,14 @@
+     }
+   }
+ 
++  /* m52xq: removing the visible display (e.g. a second call that was not answered) leaves the stack without a
++   * visible child: the window was empty and the held first call had no controls. Show a remaining call. */
++  if (g_list_model_get_n_items (G_LIST_MODEL (self->calls)) > 0) {
++    g_autoptr (CallsCallSelectorItem) first = g_list_model_get_item (G_LIST_MODEL (self->calls), 0);
++
++    set_focus (self, calls_call_selector_item_get_display (first));
++  }
++
+   update_visibility (self);
+ }
+ 

@@ -1,0 +1,82 @@
+--- a/src/dbus/org.gnome.Calls.Call.xml	2026-10-12 21:00:27.000000000 +0300
++++ b/src/dbus/org.gnome.Calls.Call.xml	2026-11-12 15:08:36.277330423 +0200
+@@ -55,6 +55,15 @@
+       </arg>
+     </method>
+     <!--
++        Hold:
++        @hold: %TRUE to put the call on hold, %FALSE to resume it.
++
++        m52xq: put an active call on hold or resume a held one.
++    -->
++    <method name="Hold">
++      <arg name="hold" type="b" direction="in"/>
++    </method>
++    <!--
+         Silence:
+ 
+         Silence the ringing of incoming call
+@@ -147,6 +156,12 @@
+         </doc:description>
+       </doc:doc>
+     </property>
++    <!--
++        CanHold:
++
++        m52xq: whether the call can be put on hold and resumed.
++    -->
++    <property name="CanHold" type="b" access="read"/>
+ 
+     <!--
+         Hints:
+--- a/src/calls-dbus-manager.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-dbus-manager.c	2026-11-12 15:08:45.889216479 +0200
+@@ -91,6 +91,30 @@
+ 
+ 
+ static gboolean
++on_handle_call_hold (CallsDBusCallsCall    *skeleton,
++                     GDBusMethodInvocation *invocation,
++                     gboolean               hold,
++                     CallsUiCallData       *call)
++{
++  g_return_val_if_fail (CALLS_DBUS_IS_CALLS_CALL (skeleton), FALSE);
++  g_return_val_if_fail (CALLS_IS_UI_CALL_DATA (call), FALSE);
++
++  /* m52xq */
++  cui_call_hold (CUI_CALL (call), hold);
++
++  calls_dbus_calls_call_complete_hold (skeleton, invocation);
++  return TRUE;
++}
++
++
++static void
++on_notify_can_hold (CallsUiCallData *call, GParamSpec *pspec, CallsDBusCallsCall *iface)
++{
++  calls_dbus_calls_call_set_can_hold (iface, cui_call_get_can_hold (CUI_CALL (call)));
++}
++
++
++static gboolean
+ on_handle_call_hangup (CallsDBusCallsCall    *skeleton,
+                        GDBusMethodInvocation *invocation,
+                        CallsUiCallData       *call)
+@@ -255,6 +279,7 @@
+   g_object_connect (iface,
+                     "object-signal::handle-accept", G_CALLBACK (on_handle_call_accept), call,
+                     "object-signal::handle-hangup", G_CALLBACK (on_handle_call_hangup), call,
++                    "object-signal::handle-hold", G_CALLBACK (on_handle_call_hold), call,
+                     "object-signal::handle-send_dtmf", G_CALLBACK (on_handle_call_send_dtmf), call,
+                     "object-signal::handle-silence", G_CALLBACK (on_handle_call_silence), call,
+                     NULL);
+@@ -265,6 +290,9 @@
+   g_object_bind_property (call, "protocol", iface, "protocol", G_BINDING_SYNC_CREATE);
+   g_object_bind_property (call, "encrypted", iface, "encrypted", G_BINDING_SYNC_CREATE);
+   g_object_set (iface, "can-dtmf", cui_call_get_can_dtmf (call), NULL);
++  /* m52xq: CanHold follows the call state (the MM call has a hold vfunc) */
++  g_signal_connect (call, "notify::state", G_CALLBACK (on_notify_can_hold), iface);
++  on_notify_can_hold (CALLS_UI_CALL_DATA (call), NULL, iface);
+ 
+   g_object_bind_property_full (call, "avatar-icon",
+                                iface, "image-path",

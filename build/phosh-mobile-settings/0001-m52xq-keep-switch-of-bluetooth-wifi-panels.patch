@@ -1,0 +1,22 @@
+diff -ru a/src/ms-cc-panels.c b/src/ms-cc-panels.c
+--- a/src/ms-cc-panels.c	2026-11-17 01:45:56.895561094 +0200
++++ b/src/ms-cc-panels.c	2026-11-17 01:45:56.911561301 +0200
+@@ -134,7 +134,17 @@
+ 
+     /* Disable headerbar as one is enough */
+     headerbar = cc_panel_find_header_bar (cc_panel);
+-    if (headerbar) {
++    if (headerbar && (g_str_equal (data->name, "bluetooth") || g_str_equal (data->name, "wifi"))) {
++      /*
++       * m52xq (2026-11-17): the Bluetooth and Wi-Fi panels have their on/off switch in this header bar; hiding it
++       * removed the switch (no way to turn Bluetooth off in Mobile Settings). Keep the bar with only its end
++       * widgets: no title, no back button, no window buttons.
++       */
++      adw_header_bar_set_show_title (headerbar, FALSE);
++      adw_header_bar_set_show_back_button (headerbar, FALSE);
++      adw_header_bar_set_show_start_title_buttons (headerbar, FALSE);
++      adw_header_bar_set_show_end_title_buttons (headerbar, FALSE);
++    } else if (headerbar) {
+       gtk_widget_set_visible (GTK_WIDGET (headerbar), FALSE);
+     } else {
+       g_critical ("No header bar found for panel %s", data->name);

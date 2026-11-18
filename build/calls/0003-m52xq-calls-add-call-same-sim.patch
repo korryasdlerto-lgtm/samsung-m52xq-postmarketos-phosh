@@ -1,0 +1,87 @@
+--- a/src/calls-new-call-box.c	2026-10-12 21:00:27.000000000 +0300
++++ b/src/calls-new-call-box.c	2026-11-12 16:49:43.813406975 +0200
+@@ -63,13 +63,63 @@
+ G_DEFINE_TYPE (CallsNewCallBox, calls_new_call_box, ADW_TYPE_BIN);
+ 
+ 
++/* m52xq: with two SIMs in dual standby the modem refuses a call on the other SIM while a call (even a held one) exists
++ * (QMI DeviceInUse). A second call (Add call) therefore always goes through the origin of the existing call. */
++static CallsOrigin *
++m52xq_find_busy_origin (CallsNewCallBox *self)
++{
++  GListModel *model = adw_combo_row_get_model (self->origin_list);
++  guint n_items = model ? g_list_model_get_n_items (model) : 0;
++
++  for (guint i = 0; i < n_items; i++) {
++    g_autoptr (CallsOrigin) origin = g_list_model_get_item (model, i);
++    g_autoptr (GList) calls = calls_origin_get_calls (origin);
++
++    for (GList *l = calls; l; l = l->next) {
++      if (calls_call_get_state (CALLS_CALL (l->data)) != CALLS_CALL_STATE_DISCONNECTED)
++        return g_steal_pointer (&origin);
++    }
++  }
++
++  return NULL;
++}
++
++
++/* m52xq: select the origin of the existing call in the list and lock the choice while that call exists */
++static void
++m52xq_sync_busy_origin (CallsNewCallBox *self)
++{
++  g_autoptr (CallsOrigin) busy = m52xq_find_busy_origin (self);
++  GListModel *model = adw_combo_row_get_model (self->origin_list);
++
++  gtk_widget_set_sensitive (GTK_WIDGET (self->origin_list_box), busy == NULL);
++
++  if (!busy || !model)
++    return;
++
++  for (guint i = 0; i < g_list_model_get_n_items (model); i++) {
++    g_autoptr (CallsOrigin) origin = g_list_model_get_item (model, i);
++
++    if (origin == busy) {
++      if (adw_combo_row_get_selected (self->origin_list) != i)
++        adw_combo_row_set_selected (self->origin_list, i);
++      break;
++    }
++  }
++}
++
++
+ static CallsOrigin *
+ get_selected_origin (CallsNewCallBox *self)
+ {
+   g_autoptr (CallsOrigin) origin = NULL;
++  g_autoptr (CallsOrigin) busy = m52xq_find_busy_origin (self);
+   GListModel *model = adw_combo_row_get_model (self->origin_list);
+   gint index = -1;
+ 
++  if (busy)
++    return g_steal_pointer (&busy);
++
+   if (model)
+     index = adw_combo_row_get_selected (self->origin_list);
+ 
+@@ -90,6 +140,10 @@
+   GListModel *model;
+   gboolean auto_use_def_origin =
+     calls_settings_get_use_default_origins (settings);
++  g_autoptr (CallsOrigin) busy = m52xq_find_busy_origin (self);
++
++  if (busy)
++    return g_steal_pointer (&busy);
+ 
+   if (auto_use_def_origin) {
+     guint n_items;
+@@ -343,6 +397,9 @@
+                             self);
+ 
+   origin_count_changed_cb (self);
++
++  /* m52xq: every time the dial pad is shown, pick the SIM of the existing call (Add call) */
++  g_signal_connect_swapped (self, "map", G_CALLBACK (m52xq_sync_busy_origin), self);
+ }
+ 
+ 

@@ -1,0 +1,204 @@
+diff --git a/src/calls-application.c b/src/calls-application.c
+index 9e751f4..2e579d5 100644
+--- a/src/calls-application.c
++++ b/src/calls-application.c
+@@ -418,6 +418,19 @@ show_accounts (GSimpleAction *action,
+   calls_main_window_show_accounts_overview (app->main_window);
+ }
+ 
++/* m52xq: "Swap" in the main window: the same as the button of the call window */
++static void
++m52xq_swap_calls (GSimpleAction *action,
++                  GVariant      *parameter,
++                  gpointer       user_data)
++{
++  CallsApplication *app = CALLS_APPLICATION (user_data);
++
++  if (app->call_window)
++    calls_call_window_m52xq_swap (app->call_window);
++}
++
++
+ /* m52xq: "Add call" on the call screen: show the main window with the dial pad */
+ static void
+ show_dial_pad (GSimpleAction *action,
+@@ -453,6 +466,7 @@ static const GActionEntry actions[] =
+   /* TODO About dialog { "about", show_about, NULL}, */
+   { "accounts", show_accounts, NULL },
+   { "show-dial-pad", show_dial_pad, NULL },
++  { "m52xq-swap-calls", m52xq_swap_calls, NULL },
+ };
+ 
+ 
+diff --git a/src/calls-call-window.c b/src/calls-call-window.c
+index c3479d0..054ed77 100644
+--- a/src/calls-call-window.c
++++ b/src/calls-call-window.c
+@@ -27,6 +27,7 @@
+ #define G_LOG_DOMAIN "CallsCallWindow"
+ 
+ #include "calls-call-window.h"
++#include "calls-main-window.h"
+ #include "calls-origin.h"
+ #include "calls-call-selector-item.h"
+ #include "calls-new-call-box.h"
+@@ -101,12 +102,39 @@ update_swap_button (CallsCallWindow *self)
+ 
+   gtk_widget_set_visible (GTK_WIDGET (self->swap_calls), n > 1);
+   gtk_widget_set_sensitive (GTK_WIDGET (self->swap_calls), n > 1 && can_swap);
++
++  /* m52xq: the same "Swap" in the main window (it is in front after "Add call"): a banner with the calls,
++   * ▶ = active, ⏸ = on hold */
++  {
++    GtkApplication *app = gtk_window_get_application (GTK_WINDOW (self));
++    g_autoptr (GString) title = g_string_new (NULL);
++
++    for (guint i = 0; i < n; i++) {
++      g_autoptr (CallsCallSelectorItem) item = g_list_model_get_item (G_LIST_MODEL (self->calls), i);
++      CuiCall *call = cui_call_display_get_call (calls_call_selector_item_get_display (item));
++      CuiCallState state = cui_call_get_state (call);
++      const char *name = cui_call_get_display_name (call);
++
++      if (!name || !*name)
++        name = cui_call_get_id (call);
++      if (title->len)
++        g_string_append (title, "    ");
++      g_string_append_printf (title, "%s %s",
++                              state == CUI_CALL_STATE_HELD ? "⏸" :
++                              state == CUI_CALL_STATE_ACTIVE ? "▶" : "…",
++                              name ? name : "");
++    }
++
++    for (GList *l = app ? gtk_application_get_windows (app) : NULL; l; l = l->next) {
++      if (CALLS_IS_MAIN_WINDOW (l->data))
++        calls_main_window_m52xq_set_swap (CALLS_MAIN_WINDOW (l->data), n > 1, n > 1 && can_swap, title->str);
++    }
++  }
+ }
+ 
+ 
+-static void
+-swap_calls_clicked_cb (GtkButton       *button,
+-                       CallsCallWindow *self)
++void
++calls_call_window_m52xq_swap (CallsCallWindow *self)
+ {
+   guint n = g_list_model_get_n_items (G_LIST_MODEL (self->calls));
+   CuiCall *held = NULL;
+@@ -129,6 +157,14 @@ swap_calls_clicked_cb (GtkButton       *button,
+ }
+ 
+ 
++static void
++swap_calls_clicked_cb (GtkButton       *button,
++                       CallsCallWindow *self)
++{
++  calls_call_window_m52xq_swap (self);
++}
++
++
+ static void
+ on_call_state_changed_swap (CuiCall         *call,
+                             GParamSpec      *pspec,
+diff --git a/src/calls-call-window.h b/src/calls-call-window.h
+index 355772a..0058b91 100644
+--- a/src/calls-call-window.h
++++ b/src/calls-call-window.h
+@@ -38,6 +38,7 @@ G_BEGIN_DECLS
+ G_DECLARE_FINAL_TYPE (CallsCallWindow, calls_call_window, CALLS, CALL_WINDOW, GtkApplicationWindow);
+ 
+ CallsCallWindow *calls_call_window_new (GtkApplication *application);
++void             calls_call_window_m52xq_swap (CallsCallWindow *self);
+ 
+ G_END_DECLS
+ 
+diff --git a/src/calls-main-window.c b/src/calls-main-window.c
+index 6cd622d..d8733b8 100644
+--- a/src/calls-main-window.c
++++ b/src/calls-main-window.c
+@@ -54,6 +54,7 @@ struct _CallsMainWindow {
+   AdwViewStack           *main_stack;
+ 
+   AdwBanner              *permanent_error_banner;
++  AdwBanner              *m52xq_swap_banner;
+ 
+   CallsAccountOverview   *account_overview;
+   CallsNewCallBox        *new_call;
+@@ -420,6 +421,14 @@ dispose (GObject *object)
+ }
+ 
+ 
++static void
++m52xq_swap_banner_clicked_cb (AdwBanner       *banner,
++                              CallsMainWindow *self)
++{
++  gtk_widget_activate_action (GTK_WIDGET (self), "app.m52xq-swap-calls", NULL);
++}
++
++
+ static void
+ calls_main_window_class_init (CallsMainWindowClass *klass)
+ {
+@@ -444,6 +453,8 @@ calls_main_window_class_init (CallsMainWindowClass *klass)
+   gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, toast_overlay);
+   gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, main_stack);
+   gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, permanent_error_banner);
++  gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, m52xq_swap_banner);
++  gtk_widget_class_bind_template_callback (widget_class, m52xq_swap_banner_clicked_cb);
+ 
+   gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, ussd_dialog);
+   gtk_widget_class_bind_template_child (widget_class, CallsMainWindow, ussd_stack);
+@@ -507,6 +518,21 @@ calls_main_window_dial (CallsMainWindow *self,
+ }
+ 
+ /* m52xq: Add call during a call */
++/* m52xq: banner "Swap" while there are two calls (the call window may be behind this one) */
++void
++calls_main_window_m52xq_set_swap (CallsMainWindow *self,
++                                  gboolean         visible,
++                                  gboolean         sensitive,
++                                  const char      *title)
++{
++  g_return_if_fail (CALLS_IS_MAIN_WINDOW (self));
++
++  adw_banner_set_title (self->m52xq_swap_banner, title ? title : "");
++  adw_banner_set_button_label (self->m52xq_swap_banner, sensitive ? "Swap" : NULL);
++  adw_banner_set_revealed (self->m52xq_swap_banner, visible);
++}
++
++
+ void
+ calls_main_window_show_dial_pad (CallsMainWindow *self)
+ {
+diff --git a/src/calls-main-window.h b/src/calls-main-window.h
+index 1cafaea..a185af7 100644
+--- a/src/calls-main-window.h
++++ b/src/calls-main-window.h
+@@ -39,6 +39,10 @@ void             calls_main_window_dial                     (CallsMainWindow *se
+                                                              const gchar     *target);
+ void             calls_main_window_show_accounts_overview   (CallsMainWindow *self);
+ void             calls_main_window_show_dial_pad            (CallsMainWindow *self);
++void             calls_main_window_m52xq_set_swap           (CallsMainWindow *self,
++                                                             gboolean         visible,
++                                                             gboolean         sensitive,
++                                                             const char      *title);
+ 
+ G_END_DECLS
+ 
+diff --git a/src/ui/main-window.ui b/src/ui/main-window.ui
+index 220e6a6..ce21f5e 100644
+--- a/src/ui/main-window.ui
++++ b/src/ui/main-window.ui
+@@ -40,6 +40,12 @@
+                   <object class="AdwBanner" id="permanent_error_banner">
+                   </object>
+                 </child>
++                <child>
++                  <object class="AdwBanner" id="m52xq_swap_banner">
++                    <property name="button-label">Swap</property>
++                    <signal name="button-clicked" handler="m52xq_swap_banner_clicked_cb" swapped="no"/>
++                  </object>
++                </child>
+                 <child>
+                   <object class="AdwViewStack" id="main_stack">
+                     <property name="vhomogeneous">False</property>

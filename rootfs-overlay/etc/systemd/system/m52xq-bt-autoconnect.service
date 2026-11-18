@@ -1,0 +1,12 @@
+[Unit]
+Description=M52XQ: connect paired audio devices (headphones) when Bluetooth is switched on
+After=bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/bin/m52xq-bt-autoconnect
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

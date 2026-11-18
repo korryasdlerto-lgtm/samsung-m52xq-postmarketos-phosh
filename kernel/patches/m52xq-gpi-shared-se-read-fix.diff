@@ -1,0 +1,143 @@
+diff -ruN a/drivers/dma/qcom/gpi.c b/drivers/dma/qcom/gpi.c
+--- a/drivers/dma/qcom/gpi.c	2026-11-18 22:11:48.266883163 +0200
++++ b/drivers/dma/qcom/gpi.c	2026-11-18 22:11:48.270876816 +0200
+@@ -529,6 +529,8 @@
+ 	struct gchan *gchan;
+ 	struct gpi_tre tre[MAX_TRE];
+ 	u32 num_tre;
++	/* M52XQ v261: this TX descriptor ends with an UNLOCK TRE (shared SE): its EOT is not the end, its EOB is */
++	bool m52xq_unlock;
+ };
+ 
+ static const u32 GPII_CHAN_DIR[MAX_CHANNELS_PER_GPII] = {
+@@ -923,7 +925,6 @@
+ 	struct gpi_desc *gpi_desc;
+ 	struct virt_dma_desc *vd;
+ 	unsigned long flags;
+-	u32 chid;
+ 
+ 	/*
+ 	 * If channel not active don't process event
+@@ -969,13 +970,9 @@
+ 	/* make sure rp updates are immediately visible to all cores */
+ 	smp_wmb();
+ 
+-	chid = imed_event->chid;
+-	if (imed_event->code == MSM_GPI_TCE_EOT && gpii->ieob_set) {
+-		if (chid == GPI_RX_CHAN)
+-			goto gpi_free_desc;
+-		else
+-			return;
+-	}
++	/* M52XQ v261: TX with UNLOCK: wait for the EOB of the unlock (RX EOT completes a read normally) */
++	if (imed_event->code == MSM_GPI_TCE_EOT && gpi_desc->m52xq_unlock)
++		return;
+ 
+ 	if (imed_event->code == MSM_GPI_TCE_UNEXP_ERR)
+ 		result.result = DMA_TRANS_ABORTED;
+@@ -986,7 +983,6 @@
+ 	dma_cookie_complete(&vd->tx);
+ 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
+ 
+-gpi_free_desc:
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	list_del(&vd->node);
+ 	spin_unlock_irqrestore(&gchan->vc.lock, flags);
+@@ -994,6 +990,24 @@
+ 	gpi_desc = NULL;
+ }
+ 
++/*
++ * M52XQ v260 (2026-11-16): trace of the GPI events (loud speaker silence: the TFA9878 bus i2c@984000 is a shared SE, its
++ * reads came back as 0x0000 and "Event without a pending descriptor!" came on the TX channel with code EOB).
++ * v261: the trace of every event is gone (8000 lines in 2 min hung the phone during a call), only orphans are logged.
++ */
++
++static void m52xq_trace_event(struct gchan *gchan, struct xfer_compl_event *ev, void *tre_virt, bool pending, const char *what)
++{
++	struct gpi_tre *tre = tre_virt;
++	u32 tre_type = tre ? (tre->dword[3] >> 16) & 0xff : 0xff;
++
++	dev_info(gchan->gpii->gpi_dev->dev,
++		 "m52xq %s: gpii %u ch %u code %u len %u tre %u (%08x %08x %08x %08x) pending %d ieob_set %d\n",
++		 what, gchan->gpii->gpii_id, ev->chid, ev->code, ev->length, tre_type,
++		 tre ? tre->dword[0] : 0, tre ? tre->dword[1] : 0, tre ? tre->dword[2] : 0, tre ? tre->dword[3] : 0,
++		 pending, gchan->gpii->ieob_set);
++}
++
+ /* processing transfer completion events */
+ static void gpi_process_xfer_compl_event(struct gchan *gchan,
+ 					 struct xfer_compl_event *compl_event)
+@@ -1005,7 +1019,6 @@
+ 	struct gpi_desc *gpi_desc;
+ 	struct dmaengine_result result;
+ 	unsigned long flags;
+-	u32 chid;
+ 
+ 	/* only process events on active channel */
+ 	if (unlikely(gchan->pm_state != ACTIVE_STATE)) {
+@@ -1016,6 +1029,8 @@
+ 
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	vd = vchan_next_desc(&gchan->vc);
++	if (!vd)
++		m52xq_trace_event(gchan, compl_event, ev_rp, false, "ORPHAN");
+ 	if (!vd) {
+ 		struct gpi_ere *gpi_ere;
+ 
+@@ -1044,13 +1059,9 @@
+ 	/* update must be visible to other cores */
+ 	smp_wmb();
+ 
+-	chid = compl_event->chid;
+-	if (compl_event->code == MSM_GPI_TCE_EOT && gpii->ieob_set) {
+-		if (chid == GPI_RX_CHAN)
+-			goto gpi_free_desc;
+-		else
+-			return;
+-	}
++	/* M52XQ v261: TX with UNLOCK: wait for the EOB of the unlock (RX EOT completes a read normally) */
++	if (compl_event->code == MSM_GPI_TCE_EOT && gpi_desc->m52xq_unlock)
++		return;
+ 
+ 	if (compl_event->code == MSM_GPI_TCE_UNEXP_ERR) {
+ 		dev_err(gpii->gpi_dev->dev, "Error in Transaction\n");
+@@ -1065,7 +1076,6 @@
+ 	dma_cookie_complete(&vd->tx);
+ 	dmaengine_desc_get_callback_invoke(&vd->tx, &result);
+ 
+-gpi_free_desc:
+ 	spin_lock_irqsave(&gchan->vc.lock, flags);
+ 	list_del(&vd->node);
+ 	spin_unlock_irqrestore(&gchan->vc.lock, flags);
+@@ -1732,7 +1742,12 @@
+ 		 * by gpi_process_xfer_compl_event() via ieob_set.
+ 		 */
+ 		tre->dword[3] |= u32_encode_bits(1, TRE_FLAGS_IEOB);
+-		chan->gpii->ieob_set = true;
++		/*
++		 * M52XQ v261: per descriptor. The old gpii-wide ieob_set was cleared by the RX prep of the same
++		 * read (gpi_prep_slave_sg), so the TX EOT completed the read before its data had arrived
++		 * (TFA9878 registers read as 0x0000 / stale) and the UNLOCK EOB became an orphan event.
++		 */
++		desc->m52xq_unlock = true;
+ 	}
+ 
+ 	for (i = 0; i < tre_idx; i++)
+diff -ruN a/drivers/i2c/busses/i2c-qcom-geni.c b/drivers/i2c/busses/i2c-qcom-geni.c
+--- a/drivers/i2c/busses/i2c-qcom-geni.c	2026-11-18 22:11:48.270876816 +0200
++++ b/drivers/i2c/busses/i2c-qcom-geni.c	2026-11-18 22:11:48.274870469 +0200
+@@ -731,7 +731,12 @@
+ 	 * M52XQ: the EOB of the TX half of a read only frees its TREs; the
+ 	 * transfer completes on the RX EOT, so no callback here.
+ 	 */
+-	if (!peripheral->link_ieob) {
++	/*
++	 * M52XQ v261: on a shared SE the TX half of a read (GO + UNLOCK) must not complete the transfer either:
++	 * only the RX EOT means the data is in the buffer (before, the TX half completed it and the TFA9878
++	 * registers read back as 0x0000 / stale values).
++	 */
++	if (!peripheral->link_ieob && !(op == I2C_WRITE && (msgs[msg_idx].flags & I2C_M_RD))) {
+ 		desc->callback_result = i2c_gpi_cb_result;
+ 		desc->callback_param = gi2c;
+ 	}

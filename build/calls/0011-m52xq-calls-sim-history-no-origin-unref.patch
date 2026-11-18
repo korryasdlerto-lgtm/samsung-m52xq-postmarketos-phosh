@@ -1,0 +1,15 @@
+diff --git a/src/calls-record-store.c b/src/calls-record-store.c
+index e746465..4b84681 100644
+--- a/src/calls-record-store.c
++++ b/src/calls-record-store.c
+@@ -488,7 +488,9 @@ record_call (CallsRecordStore *self,
+ 
+   /* m52xq: remember which SIM the call went through */
+   if (origin_id && *origin_id) {
+-    g_autoptr (CallsOrigin) origin =
++    /* transfer none: no unref here (a g_autoptr disposed the origin of the SIM at every new call: the call
++     * vanished from Calls after 3 s and Calls crashed later, 2026-11-14) */
++    CallsOrigin *origin =
+       calls_manager_get_origin_by_id (calls_manager_get_default (), origin_id);
+ 
+     if (origin)

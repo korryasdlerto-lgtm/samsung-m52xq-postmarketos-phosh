@@ -1,0 +1,6 @@
+# M52XQ (postmarketOS Phosh): screen off after 60 s, suspend after 120 s idle on battery (user, 2026-11-13; same as the Debian port)
+[org.gnome.desktop.session]
+idle-delay=uint32 60
+
+[org.gnome.settings-daemon.plugins.power]
+sleep-inactive-battery-timeout=120

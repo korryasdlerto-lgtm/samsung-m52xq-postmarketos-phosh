@@ -1,0 +1,19 @@
+#!/bin/sh
+# M52XQ: iio-sensor-proxy probes the sensors once, at start. The ADSP sensor PD registers the accelerometer and the
+# proximity sensor up to ~60 s after boot. This service starts iio-sensor-proxy early (before the Phosh session, which
+# needs a running service for its rotation), waits until SSC streams accelerometer data (max 120 s) and, if
+# iio-sensor-proxy has no accelerometer yet, restarts it once; Phosh then sees HasAccelerometer and enables rotation.
+systemctl start iio-sensor-proxy.service
+i=0
+while [ $i -lt 120 ]; do
+	timeout 4 ssccli --sensor accelerometer 2>/dev/null | grep -q measurement && break
+	i=$((i + 1))
+	sleep 1
+done
+has=$(busctl get-property net.hadess.SensorProxy /net/hadess/SensorProxy net.hadess.SensorProxy HasAccelerometer 2>/dev/null)
+echo "m52xq-sensor-kick: accelerometer streams after ${i} s, iio-sensor-proxy HasAccelerometer: ${has:-?}"
+if [ "$has" != "b true" ]; then
+	systemctl restart iio-sensor-proxy.service
+	echo "m52xq-sensor-kick: iio-sensor-proxy restarted: $?"
+fi
+exit 0

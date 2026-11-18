@@ -1,0 +1,90 @@
+# m52xq (дроидиан/постмаркет в3): dial pad in landscape: number and call button left, keys right, no scrolling
+# r93: Hold (HoldAndAccept of the modem) and Add call (hold + dial pad) work; r91/r92: mute/speaker show their state. Landscape dial pad.
+# (libcall-ui CuiDialpad, switches on the window size; portrait unchanged).
+# Contributor: Bart Ribbers <bribbers@disroot.org>
+maintainer="team/gnome <achill@achill.org>"
+pkgname=calls
+pkgver=51.1
+pkgrel=108
+pkgdesc="Phone dialer and call handler"
+arch="all"
+url="https://gitlab.gnome.org/GNOME/calls"
+license="GPL-3.0-or-later"
+depends="
+	callaudiod
+	modemmanager
+	sofia-sip-linphone
+	"
+makedepends="
+	callaudiod-dev
+	desktop-file-utils
+	evolution-data-server-dev
+	feedbackd-dev
+	folks-dev
+	gettext-dev
+	gmobile-dev
+	gobject-introspection-dev
+	gom-dev
+	gsound-dev
+	gstreamer-dev
+	gtk4.0-dev
+	libadwaita-dev
+	libpeas2-dev
+	meson
+	mobile-broadband-provider-info
+	modemmanager-dev
+	ninja
+	py3-docutils
+	sofia-sip-linphone-dev
+	vala
+	"
+subpackages="$pkgname-doc $pkgname-dbg $pkgname-lang $pkgname-systemd"
+source="https://download.gnome.org/sources/calls/${pkgver%%.*}/calls-$pkgver.tar.xz
+	0001-m52xq-calls-dialpad-buttons-hold-add-call.patch
+	0002-m52xq-calls-dbus-hold.patch
+	0003-m52xq-calls-add-call-same-sim.patch
+	0004-m52xq-calls-allow-second-call.patch
+	0005-m52xq-calls-show-remaining-call.patch
+	0006-m52xq-calls-swap-button.patch
+	0007-m52xq-calls-present-window-after-call-ends.patch
+	0008-m52xq-calls-sim-in-history.patch
+	0009-m52xq-calls-swap-in-main-window.patch
+	0010-m52xq-calls-no-hangup-on-window-hide.patch
+	0011-m52xq-calls-sim-history-no-origin-unref.patch
+	0012-m52xq-calls-landscape-call-display.patch
+	0013-m52xq-calls-present-window-for-second-call.patch
+	"
+options="!check" # Requires running Wayland compositor
+
+build() {
+	abuild-meson \
+		-Db_lto=true \
+		-Dtests="$(want_check && echo true || echo false)" \
+		. output
+	meson compile -C output
+}
+
+check() {
+	meson test --print-errorlogs -C output
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild -C output
+}
+
+sha512sums="
+a3a4c3bc23a073f519142dae7e5dceb73a04340aab34fe3a6a78c25a1e07247d25008e370f380bc765ef8c67b4a21f5e4906b80b92c04006a55da84ae5c42445  calls-51.1.tar.xz
+3f39bbfdec000acdff0bae260aee76c738b9604f551cba485e9319a0f928ed4e312a212e464cdeee81beed595defb93177a10c0c00a4bc4d651c4d1cf1652f44  0001-m52xq-calls-dialpad-buttons-hold-add-call.patch
+778408ec8d61d21049f0af08e67cc38574036f1733e2748b73a56f452c8975143201d7f2510744459b1a26f4abe536125bf669289adf2751b606ab2006b713c2  0002-m52xq-calls-dbus-hold.patch
+2ff28f1c7d5db7b9f30e101dfa1b5921207e617bd8d95da440f415089dca638ca34af263e065ad997c4fc339049c9e07fdc5775950f778f513c2520741808fec  0003-m52xq-calls-add-call-same-sim.patch
+4e5ed1284d4ec08374292a14022cbf9f19f9ca5b365c5cd3b62190dd7d1004f6eec50cc72f174a551f46fac1cb05af8e4f367f1dabe6fae49bdb2c1cb0ffd716  0004-m52xq-calls-allow-second-call.patch
+d23081936d01f4077c1e70dfe13928f45c09068bbc3decae4cbde137236e968a7b3ef1bc1d334896559f5fb8c74e99ab4a5aff4d3b390b9226d2914e8d2efcb9  0005-m52xq-calls-show-remaining-call.patch
+d46646d44d9aa48823c99ed3ee19b5f3f873977fc6efd69c47a00af7524e27c063ba15aa9787e9c8c407178644c5eabb893c7a3f57df39170776d4004736663f  0006-m52xq-calls-swap-button.patch
+c75604b2a1425c52e001c6290901c7ce55f943c58be51d8cf2f489c9e8cd3e0f09b7464d23ecce03b5044d753a80d2ae7c0601e291838200812d51ae053a81f1  0007-m52xq-calls-present-window-after-call-ends.patch
+c12e4cbc45b786ca90c27b3fc65bb19aed5b1a0a23fb50c4b3b5175b624d5483c7eafdbbb4f9829b0660a279c072b9cd96e05839a7c6ff71cb5f587f67dff955  0008-m52xq-calls-sim-in-history.patch
+68fa929f597b19d0be65d107b37d06b51379dc0d26d31d758292ae2feb642fd5ecbc2f03a73dc749ea3be3d2850724f826f6adc447386edff3cb45b69f5a2dd6  0009-m52xq-calls-swap-in-main-window.patch
+a3c32d85d940564755da73ec03a73bf85f2eec9719e7fd09dd972fe5a02561e4d3572ab0d6c499db27bbc1f001a8614d27278d964bcf08e628b82839557a13f4  0010-m52xq-calls-no-hangup-on-window-hide.patch
+feb8cc8cb9b3de016cf54be69e268e029d50922a47d549d94268f9d62591efcb4101d7c72752f2b398c7a683772d635368234625f052514ade621b410d7fcdfd  0011-m52xq-calls-sim-history-no-origin-unref.patch
+8935c9be1cb0dd689a6f0f37246f160e36046290fe984ba35a410076a5717817fc251dff95f47c0f562aed25af8d0686d2a86653af150f9bc1531f095b001f77  0012-m52xq-calls-landscape-call-display.patch
+826b04df66325e613f218a67217b596c47a3b7946e6bc349eac3b2d2d5824d0107d82d77914f69e212905075e32f45a93c7230991a28ffadde6d03f61fe0a10f  0013-m52xq-calls-present-window-for-second-call.patch
+"

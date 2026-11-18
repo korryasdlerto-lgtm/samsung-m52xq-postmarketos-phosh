@@ -1,0 +1,32 @@
+#!/bin/sh
+# M52XQ (Phosh): give back what the sleep hooks switched off, once the user is really there.
+#   bt   - Bluetooth blocked by system-sleep/m52xq-ufs.sh (/run/m52xq-bt-was-on)
+#   2g   - modem network modes reduced to GSM by system-sleep/m52xq-modem-2g.sh (/run/m52xq-modem-2g-active)
+#   gps  - ModemManager GPS sources paused by system-sleep/m52xq-gps-sleep.sh (/run/m52xq-gps-paused)
+# No argument: all three (m52xq-bt-restore.service, started by m52xq-idle-suspend when a dark wake-up ends).
+what=${*:-bt 2g gps}
+L=/var/log/m52xq-sleep.log
+for w in $what; do
+	case $w in
+	bt)
+		if [ -f /run/m52xq-bt-was-on ]; then
+			rfkill unblock bluetooth 2>/dev/null
+			rm -f /run/m52xq-bt-was-on
+		fi
+		;;
+	2g)
+		[ -f /run/m52xq-modem-2g-active ] && /usr/lib/systemd/system-sleep/m52xq-modem-2g.sh restore
+		;;
+	gps)
+		R=/run/m52xq-gps-paused
+		[ -f $R ] || continue
+		while read -r m src; do
+			args=
+			for s in $src; do args="$args --location-enable-$s"; done
+			timeout 8 mmcli -m "$m" $args >/dev/null 2>&1 && echo "gps: $m resumed ($src)" >> $L
+		done < $R
+		rm -f $R
+		;;
+	esac
+done
+exit 0

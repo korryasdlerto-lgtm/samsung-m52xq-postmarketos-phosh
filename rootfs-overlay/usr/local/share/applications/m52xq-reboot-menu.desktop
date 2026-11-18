@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Reboot menu
+Name[ru]=Меню перезагрузки
+Comment=Reboot, reboot into TWRP, power off
+Comment[ru]=Перезагрузка, перезагрузка в TWRP, выключение
+Icon=system-reboot-symbolic
+Exec=/usr/local/bin/m52xq-reboot-menu
+Terminal=false
+Categories=System;
+Keywords=recovery;twrp;reboot;poweroff;shutdown;
+X-Purism-FormFactor=Workstation;Mobile;

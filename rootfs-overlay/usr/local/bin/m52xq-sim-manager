@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+# M52XQ (Phosh): SIM cards manager — GTK4/libadwaita front end for the same root helpers as pmOS-Lomiri
+# (m52xq-sim-mode, m52xq-flight-mode; started as m52xq-sim-mode@<x>.service / m52xq-flight-mode@on|off.service,
+# allowed without a password for the active local user by /etc/polkit-1/rules.d/50-m52xq-sim-mode.rules).
+#   Both SIMs / only SIM1 / only SIM2, SIM of the mobile data, mobile data on/off (nmcli), SIM cards off/on.
+# Window title in English, buttons in the session language (ru/en).
+import os
+import subprocess
+import threading
+
+import gi
+gi.require_version('Gtk', '4.0')
+gi.require_version('Adw', '1')
+from gi.repository import Adw, Gio, GLib, Gtk
+
+RU = os.environ.get('LANG', '').startswith('ru')
+T = {
+    'both': ('Обе SIM-карты', 'Both SIM cards'),
+    'sim1': ('Только SIM 1', 'Only SIM 1'),
+    'sim2': ('Только SIM 2', 'Only SIM 2'),
+    'mode': ('Активные SIM-карты', 'Active SIM cards'),
+    'data': ('Мобильные данные', 'Mobile data'),
+    'data_on': ('Мобильные данные включены', 'Mobile data on'),
+    'data_sim': ('SIM мобильных данных', 'SIM of the mobile data'),
+    'cards': ('SIM-карты и радио модема', 'SIM cards and modem radio'),
+    'cards_on': ('SIM-карты включены', 'SIM cards on'),
+    'cancel': ('Отмена', 'Cancel'),
+    'busy': ('Подождите…', 'Please wait…'),
+    'one_card': ('Вставлена одна SIM-карта: выбор режима недоступен', 'One SIM card inserted: mode choice is off'),
+    'done_mode': ('Готово, SIM-карты регистрируются в сети (~30 с)', 'Done, the SIM cards register (~30 s)'),
+    'flight_on': ('SIM-карты и радио модема выключены', 'SIM cards and the modem radio are off'),
+    'flight_off': ('SIM-карты включены, регистрация ~30 с', 'SIM cards are on, registering (~30 s)'),
+    'no_conn': ('Нет мобильного подключения в NetworkManager', 'No mobile connection in NetworkManager'),
+    'fail': ('Ошибка: ', 'Failed: '),
+}
+
+
+def tr(k):
+    return T[k][0 if RU else 1]
+
+
+def run(cmd, timeout=320):
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).strip()
+    except Exception as e:  # noqa: BLE001
+        return 1, str(e)
+
+
+def gsm_conn():
+    rc, out = run(['nmcli', '-t', '-f', 'NAME,TYPE,ACTIVE', 'connection', 'show'], 20)
+    for line in out.splitlines():
+        p = line.rsplit(':', 2)
+        if len(p) == 3 and p[1] == 'gsm':
+            return p[0], p[2] == 'yes'
+    return None, False
+
+
+def cards_present():
+    """Card slots with a SIM card inserted, like m52xq-sim-mode cards_present(): "1", "2", "12" ("" = unknown)."""
+    rc, out = run(['timeout', '15', 'qmicli', '-d', 'qrtr://0', '--uim-get-card-status'], 20)
+    present, slot = '', None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith('Slot ['):
+            slot = ''.join(c for c in line.split(']')[0] if c.isdigit())
+        elif slot and line.startswith('Card state:'):
+            if 'present' in line:
+                present += slot
+            slot = None
+    return present
+
+
+def read_state(cards=None):
+    rc, out = run(['/usr/local/sbin/m52xq-sim-mode', 'status'], 30)
+    mode, data = 'dsds', '1'
+    if rc == 0 and out:
+        f = out.split()
+        mode = f[0] if f else mode
+        data = f[1] if len(f) > 1 else data
+    flight = os.path.exists('/etc/m52xq/flight')     # same test as "m52xq-flight-mode status"
+    conn, active = gsm_conn()
+    rc, out = run(['mmcli', '-L'], 15)
+    nmodems = out.count('/Modem/')
+    # with the SIM cards powered off (flight mode) the card state is unknown: keep all choices
+    # the card slots are read again only when asked (window opened, SIM switches), not on every 5 s tick
+    if cards is None:
+        cards = '' if flight else cards_present()
+    return {'mode': mode, 'data': data, 'flight': flight, 'conn': conn, 'data_active': active, 'modems': nmodems,
+            'cards': cards}
+
+
+class Win(Adw.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app, title='SIM cards manager', default_width=420, default_height=640)
+        self.updating = False
+        tv = Adw.ToolbarView()
+        hb = Adw.HeaderBar()
+        tv.add_top_bar(hb)
+        self.toast = Adw.ToastOverlay()
+        page = Adw.PreferencesPage()
+        self.toast.set_child(page)
+        tv.set_content(self.toast)
+        self.set_content(tv)
+
+        g = Adw.PreferencesGroup(title=tr('mode'))
+        self.mode_rows = {}
+        first = None
+        for key, lab in (('dsds', tr('both')), ('sim1', tr('sim1')), ('sim2', tr('sim2'))):
+            row = Adw.ActionRow(title=lab)
+            chk = Gtk.CheckButton()
+            if first:
+                chk.set_group(first)
+            else:
+                first = chk
+            chk.connect('toggled', self.on_mode, key)
+            row.add_prefix(chk)
+            row.set_activatable_widget(chk)
+            g.add(row)
+            self.mode_rows[key] = chk
+        page.add(g)
+
+        g = Adw.PreferencesGroup(title=tr('data'))
+        self.data_sw = Adw.SwitchRow(title=tr('data_on'))
+        self.data_sw.connect('notify::active', self.on_data)
+        g.add(self.data_sw)
+        self.dsim = Adw.ComboRow(title=tr('data_sim'), model=Gtk.StringList.new(['SIM 1', 'SIM 2']))
+        self.dsim.connect('notify::selected', self.on_dsim)
+        g.add(self.dsim)
+        page.add(g)
+
+        g = Adw.PreferencesGroup(title=tr('cards'))
+        self.cards_sw = Adw.SwitchRow(title=tr('cards_on'))
+        self.cards_sw.connect('notify::active', self.on_cards)
+        g.add(self.cards_sw)
+        page.add(g)
+
+        # Cancel: closes the window (the last window ends the application); the settings above apply at once
+        g = Adw.PreferencesGroup()
+        cb = Gtk.Button(label=tr('cancel'), height_request=56, halign=Gtk.Align.CENTER)
+        cb.add_css_class('pill')
+        cb.connect('clicked', lambda _b: self.close())
+        g.add(cb)
+        page.add(g)
+
+        self.spin = Gtk.Spinner()
+        hb.pack_end(self.spin)
+        self.st = {'mode': 'dsds', 'data': '1', 'flight': False, 'conn': None, 'data_active': False, 'modems': 0}
+        # synced with the Phosh shade (its SIM tiles start the same m52xq-sim-mode units): the state files in /etc/m52xq
+        # are watched, and the window re-reads the state every 5 s while it is shown (mobile data, modems)
+        self.mon = Gio.File.new_for_path('/etc/m52xq').monitor_directory(Gio.FileMonitorFlags.NONE, None)
+        self.mon.connect('changed', self.on_state_files_changed)
+        self.pending = 0
+        GLib.timeout_add_seconds(5, self.on_tick)
+        self.refresh()
+
+    # --- state -------------------------------------------------------------------------------------------------
+    def on_state_files_changed(self, _mon, f, _other, _ev):
+        if f.get_basename() in ('sim-mode', 'data-sim', 'flight') and not self.pending:
+            self.pending = GLib.timeout_add(700, self.on_settled)
+
+    def on_settled(self):
+        self.pending = 0
+        self.refresh()
+        return False
+
+    def on_tick(self):
+        if self.get_visible() and self.get_sensitive():
+            self.refresh(full=False)
+        return True
+
+    def refresh(self, full=True):
+        cards = None if full else self.st.get('cards')
+
+        def work():
+            st = read_state(cards)
+            GLib.idle_add(self.apply, st)
+        threading.Thread(target=work, daemon=True).start()
+
+    def apply(self, st):
+        self.st = st
+        self.updating = True
+        self.mode_rows.get(st['mode'], self.mode_rows['dsds']).set_active(True)
+        # with only one SIM active the data are on that SIM (m52xq-sim-mode: sim1 -> DDS 1, sim2 -> DDS 2), whatever
+        # the saved choice for both SIMs (/etc/m52xq/data-sim) is
+        eff = {'sim1': '1', 'sim2': '2'}.get(st['mode'], st['data'])
+        self.dsim.set_selected(1 if eff == '2' else 0)
+        # the data SIM can be chosen only with both SIMs active and the mobile data on (2026-11-12, user)
+        self.dsim.set_sensitive(st['mode'] == 'dsds' and not st['flight'] and st['data_active'])
+        self.data_sw.set_active(st['data_active'])
+        self.data_sw.set_sensitive(bool(st['conn']) and not st['flight'])
+        self.cards_sw.set_active(not st['flight'])
+        # 2026-11-12 (user): with one SIM card inserted only the mode of that card can be chosen
+        allowed = {'1': ('sim1',), '2': ('sim2',)}.get(st.get('cards', ''), ('dsds', 'sim1', 'sim2'))
+        for key, c in self.mode_rows.items():
+            c.set_sensitive(not st['flight'] and key in allowed)
+        if len(allowed) == 1:
+            self.dsim.set_sensitive(False)
+        self.updating = False
+        return False
+
+    def busy(self, on):
+        self.spin.set_spinning(on)
+        self.set_sensitive(not on)
+
+    def task(self, cmd, ok_msg):
+        self.busy(True)
+        self.toast.add_toast(Adw.Toast(title=tr('busy')))
+
+        def work():
+            rc, out = run(cmd)
+            GLib.idle_add(self.done, rc, out, ok_msg)
+        threading.Thread(target=work, daemon=True).start()
+
+    def done(self, rc, out, ok_msg):
+        self.busy(False)
+        msg = ok_msg if rc == 0 else tr('fail') + (out.splitlines()[-1] if out else str(rc))
+        self.toast.add_toast(Adw.Toast(title=msg, timeout=5))
+        self.refresh()
+        return False
+
+    # --- actions -----------------------------------------------------------------------------------------------
+    def on_mode(self, chk, key):
+        if self.updating or not chk.get_active() or key == self.st['mode']:
+            return
+        self.task(['systemctl', 'start', 'm52xq-sim-mode@%s.service' % key], tr('done_mode'))
+
+    def on_dsim(self, row, _p):
+        if self.updating:
+            return
+        want = str(row.get_selected() + 1)
+        if want == self.st['data']:
+            return
+        self.task(['systemctl', 'start', 'm52xq-sim-mode@data%s.service' % want], tr('done_mode'))
+
+    def on_data(self, sw, _p):
+        if self.updating:
+            return
+        conn = self.st.get('conn')
+        if not conn:
+            self.toast.add_toast(Adw.Toast(title=tr('no_conn')))
+            self.refresh()
+            return
+        op = 'up' if sw.get_active() else 'down'
+        if op == 'down':
+            self.task(['timeout', '60', 'nmcli', 'connection', 'down', conn], tr('data'))
+            return
+        # the data port (rmnet_ipa0) belongs to the modem object of the data SIM: qrtr0 = SIM1, qrtr0-sim2 = SIM2
+        # ("only SIM2" too); a connection bound to the other modem fails with "No valid data port found" (2026-11-11)
+        dev = 'qrtr0-sim2' if (self.st['mode'] == 'sim2' or (self.st['mode'] == 'dsds' and self.st['data'] == '2')) else 'qrtr0'
+        self.task(['sh', '-c', 'nmcli connection modify "$1" connection.interface-name "$2" && timeout 60 nmcli connection up "$1"',
+                   'm52xq-sim-manager', conn, dev], tr('data_on'))
+
+    def on_cards(self, sw, _p):
+        if self.updating:
+            return
+        if sw.get_active():
+            self.task(['systemctl', 'start', 'm52xq-flight-mode@off.service'], tr('flight_off'))
+        else:
+            self.task(['systemctl', 'start', 'm52xq-flight-mode@on.service'], tr('flight_on'))
+
+
+class App(Adw.Application):
+    def __init__(self):
+        super().__init__(application_id='org.m52xq.SimManager')
+
+    def do_activate(self):
+        w = self.props.active_window or Win(self)
+        w.present()
+
+
+if __name__ == '__main__':
+    App().run(None)

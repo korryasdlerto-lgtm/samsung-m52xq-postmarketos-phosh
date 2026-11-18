@@ -1,0 +1,19 @@
+--- a/src/mm-iface-modem.c
++++ b/src/mm-iface-modem.c
+@@ -4481,8 +4481,14 @@
+         /* fall-through */
+ 
+     case SET_POWER_STATE_STEP_CHECK:
+-        /* Already done if we're in the desired power state */
+-        if (ctx->previous_real_power_state == ctx->requested_power_state) {
++        /* Already done if we're in the desired power state.
++         * m52xq DSDS: both SIM objects share one QRTR modem. When the WWAN switch is toggled
++         * quickly, a delayed low-power request of the SIM1 object can be applied by the modem
++         * after the following enable already read back 'online', which leaves the radio off
++         * while MM reports 'searching' (only emergency calls allowed). Setting 'online' is
++         * idempotent, so with MM_QRTR_DSDS the power-up request is always sent. */
++        if (ctx->previous_real_power_state == ctx->requested_power_state &&
++            !(ctx->requested_power_state == MM_MODEM_POWER_STATE_ON && g_getenv ("MM_QRTR_DSDS"))) {
+             mm_obj_dbg (self, "no need to change power state: already '%s'",
+                         mm_modem_power_state_get_string (ctx->requested_power_state));
+             ctx->step = SET_POWER_STATE_STEP_LAST;

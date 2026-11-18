@@ -1,0 +1,1435 @@
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/plugins/syncthing-quick-setting/syncthing-quick-setting.c phosh-0.58.0/plugins/syncthing-quick-setting/syncthing-quick-setting.c
+--- a/plugins/syncthing-quick-setting/syncthing-quick-setting.c	2026-10-04 15:01:58.000000000 +0300
++++ b/plugins/syncthing-quick-setting/syncthing-quick-setting.c	2026-11-16 15:07:35.750680591 +0200
+@@ -156,7 +156,8 @@
+ 
+   self->object_manager = g_dbus_object_manager_client_new_for_bus_finish (result, &err);
+   if (!self->object_manager) {
+-    if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++    /* m52xq: inverted upstream as well, see on_manager_ready */
++    if (g_error_matches (err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+       return;
+ 
+     phosh_status_page_placeholder_set_title (self->placeholder, _("Unable to connect to Syncbus"));
+@@ -190,7 +191,9 @@
+ 
+   self->manager = syncbus_impl_manager_proxy_new_for_bus_finish (result, &err);
+   if (!self->manager) {
+-    if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++    /* m52xq: upstream had this inverted ("!g_error_matches"): after a cancel (quick setting destroyed when the
++     * custom quick settings are reloaded) it used the freed placeholder -> phosh SIGSEGV */
++    if (g_error_matches (err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+       return;
+ 
+     phosh_status_page_placeholder_set_title (self->placeholder, _("Unable to connect to Syncbus"));
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/gnome-shell-manager.c phosh-0.58.0/src/gnome-shell-manager.c
+--- a/src/gnome-shell-manager.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/gnome-shell-manager.c	2026-11-16 15:07:35.750680591 +0200
+@@ -14,6 +14,7 @@
+ 
+ #include "gnome-shell-manager.h"
+ #include "shell-priv.h"
++#include "screenshot-manager.h"
+ #include "lockscreen-manager.h"
+ 
+ #define GNOME_DESKTOP_USE_UNSTABLE_API
+@@ -83,12 +84,16 @@
+ }
+ 
+ 
++static void m52xq_vol_forget (gpointer info);
++
+ static void
+ free_accelerator_info_from_hash_table (gpointer data)
+ {
+   AcceleratorInfo *info = (AcceleratorInfo *) data;
+   g_return_if_fail (info != NULL);
+ 
++  m52xq_vol_forget (data);
++
+   remove_action_entries (info->accelerator);
+   g_clear_handle_id (&info->repeat_id, g_source_remove);
+   g_free (info->accelerator);
+@@ -548,6 +553,109 @@
+ }
+ 
+ 
++/*
++ * m52xq: screenshot with Volume Up + Volume Down pressed together, as in Lomiri: the volume does not
++ * change and no volume OSD is shown (the old helper service let gnome-settings-daemon change the volume
++ * first, so every screenshot had the OSD on it). A volume key press is held back for M52XQ_VOL_DELAY_MS;
++ * if the other volume key comes in that time, or while the first one is held, the presses are swallowed
++ * and Phosh takes a screenshot (same as the Print key, ~/Pictures/Screenshots).
++ */
++#define M52XQ_VOL_DELAY_MS 150
++
++static void accelerator_press (PhoshGnomeShellManager *self, AcceleratorInfo *info);
++
++static struct {
++  AcceleratorInfo *held[2];       /* 0 = lower, 1 = raise: pressed and not released yet */
++  AcceleratorInfo *pending;       /* press held back */
++  guint            pending_id;
++  gboolean         combo;         /* screenshot taken, swallow volume keys until both are released */
++} m52xq_vol;
++
++/* the accelerator is ungrabbed / freed: drop every reference to it */
++static void
++m52xq_vol_forget (gpointer info)
++{
++  for (int i = 0; i < 2; i++) {
++    if (m52xq_vol.held[i] == info)
++      m52xq_vol.held[i] = NULL;
++  }
++  if (m52xq_vol.pending == info) {
++    g_clear_handle_id (&m52xq_vol.pending_id, g_source_remove);
++    m52xq_vol.pending = NULL;
++  }
++}
++
++static int
++m52xq_vol_index (AcceleratorInfo *info)
++{
++  if (g_strcmp0 (info->accelerator, "XF86AudioLowerVolume") == 0)
++    return 0;
++  if (g_strcmp0 (info->accelerator, "XF86AudioRaiseVolume") == 0)
++    return 1;
++  return -1;
++}
++
++static gboolean
++on_m52xq_vol_pending (gpointer data)
++{
++  PhoshGnomeShellManager *self = phosh_gnome_shell_manager_get_default ();
++  AcceleratorInfo *info = m52xq_vol.pending;
++
++  m52xq_vol.pending_id = 0;
++  m52xq_vol.pending = NULL;
++  if (info && !m52xq_vol.combo)
++    accelerator_press (self, info);
++  return G_SOURCE_REMOVE;
++}
++
++/* Returns TRUE when the event was handled here */
++static gboolean
++m52xq_vol_event (PhoshGnomeShellManager *self, AcceleratorInfo *info, gboolean press)
++{
++  int i = m52xq_vol_index (info);
++
++  if (i < 0)
++    return FALSE;
++
++  if (!press) {
++    m52xq_vol.held[i] = NULL;
++    if (m52xq_vol.combo) {
++      if (!m52xq_vol.held[0] && !m52xq_vol.held[1])
++        m52xq_vol.combo = FALSE;
++      return TRUE;
++    }
++    /* a short tap: send the held back press now, then the release */
++    if (m52xq_vol.pending == info) {
++      g_clear_handle_id (&m52xq_vol.pending_id, g_source_remove);
++      m52xq_vol.pending = NULL;
++      accelerator_press (self, info);
++    }
++    return FALSE;
++  }
++
++  if (m52xq_vol.combo)
++    return TRUE;
++
++  m52xq_vol.held[i] = info;
++  if (m52xq_vol.held[1 - i]) {
++    PhoshScreenshotManager *sm = phosh_shell_get_screenshot_manager (phosh_shell_get_default ());
++
++    m52xq_vol.combo = TRUE;
++    g_clear_handle_id (&m52xq_vol.pending_id, g_source_remove);
++    m52xq_vol.pending = NULL;
++    g_clear_handle_id (&m52xq_vol.held[1 - i]->repeat_id, g_source_remove);
++    g_message ("m52xq: Volume Up + Volume Down: screenshot");
++    if (sm)
++      phosh_screenshot_manager_take_screenshot (sm, NULL, NULL, FALSE, FALSE);
++    return TRUE;
++  }
++
++  g_clear_handle_id (&m52xq_vol.pending_id, g_source_remove);
++  m52xq_vol.pending = info;
++  m52xq_vol.pending_id = g_timeout_add (M52XQ_VOL_DELAY_MS, on_m52xq_vol_pending, NULL);
++  return TRUE;
++}
++
+ static void
+ accelerator_activated_action (GSimpleAction *action,
+                               GVariant      *param,
+@@ -559,11 +667,23 @@
+   uint32_t action_id;
+ 
+   action_id = info->action_id;
++  if (m52xq_vol_event (self, info, press))
++    return;
++
+   if (!press) {
+     g_debug ("accelerator released for id %u", action_id);
+     g_clear_handle_id (&info->repeat_id, g_source_remove);
+     return;
+   }
++
++  accelerator_press (self, info);
++}
++
++static void
++accelerator_press (PhoshGnomeShellManager *self, AcceleratorInfo *info)
++{
++  uint32_t action_id = info->action_id;
++
+   g_debug ("accelerator action activated for id %u", action_id);
+ 
+   if ((info->grab_flags & PHOSH_SHELL_KEY_BINDING_IGNORE_AUTOREPEAT) == 0 && self->do_repeat) {
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/phosh-exported-symbols.txt.in phosh-0.58.0/src/phosh-exported-symbols.txt.in
+--- a/src/phosh-exported-symbols.txt.in	2026-10-04 15:01:58.000000000 +0300
++++ b/src/phosh-exported-symbols.txt.in	2026-11-16 15:07:35.750680591 +0200
+@@ -57,6 +57,7 @@
+ 
+    # Mobile Data wants WWan Manager
+    phosh_shell_get_wwan;
++   phosh_shell_get_wwan2;
+    phosh_wwan_has_data;
+    phosh_wwan_is_enabled;
+    phosh_wwan_is_unlocked;
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/plugin-shell.h phosh-0.58.0/src/plugin-shell.h
+--- a/src/plugin-shell.h	2026-10-04 15:01:58.000000000 +0300
++++ b/src/plugin-shell.h	2026-11-16 15:07:35.750680591 +0200
+@@ -26,6 +26,7 @@
+ /* Created on the fly */
+ PhoshWifiManager          *phosh_shell_get_wifi_manager    (PhoshShell *self);
+ PhoshWWan                 *phosh_shell_get_wwan            (PhoshShell *self);
++PhoshWWan                 *phosh_shell_get_wwan2           (PhoshShell *self);
+ 
+ PhoshMonitor              *phosh_shell_get_primary_monitor (PhoshShell *self);
+ PhoshMonitor              *phosh_shell_get_builtin_monitor (PhoshShell *self);
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/quick-settings.c phosh-0.58.0/src/quick-settings.c
+--- a/src/quick-settings.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/quick-settings.c	2026-11-16 15:07:35.750680591 +0200
+@@ -20,6 +20,8 @@
+ #include "shell-priv.h"
+ #include "wifi-status-page.h"
+ 
++#include <libmm-glib.h>
++
+ #define CUSTOM_QUICK_SETTINGS_SCHEMA "sm.puri.phosh.plugins"
+ #define CUSTOM_QUICK_SETTINGS_KEY "quick-settings"
+ 
+@@ -43,11 +45,248 @@
+   GSettings *plugin_settings;
+   PhoshPluginLoader *plugin_loader;
+   GPtrArray *custom_quick_settings;
++
++  /* m52xq: cellular flight mode (SIM cards + modem radio off, m52xq-flight-mode) */
++  PhoshQuickSetting *m52xq_flight_qs;
++  PhoshStatusIcon   *m52xq_flight_info;
++  GFileMonitor      *m52xq_flight_mon;
++
++  /* m52xq dual SIM: hide the tile of a SIM slot that ModemManager reports empty */
++  PhoshQuickSetting *m52xq_sim1_qs;
++  PhoshQuickSetting *m52xq_sim2_qs;
++  MMManager         *m52xq_mm;
++  GCancellable      *m52xq_mm_cancel;
+ };
+ 
+ G_DEFINE_TYPE (PhoshQuickSettings, phosh_quick_settings, GTK_TYPE_BIN);
+ 
+ 
++/*
++ * m52xq dual SIM: a tap on the tile of SIM 1 / SIM 2 turns only that SIM off or on with the root helper
++ * m52xq-sim-mode (units m52xq-sim-mode@dsds|sim1|sim2, allowed for the active user by polkit; ModemManager
++ * restarts, ~30 s without network). The last active SIM is not turned off; with the SIM cards off
++ * (m52xq-flight-mode) a tap turns them on again. Without the helper the tile keeps the upstream behaviour.
++ */
++#define M52XQ_SIM_MODE "/usr/local/sbin/m52xq-sim-mode"
++
++static void
++m52xq_start_unit (const char *unit)
++{
++  g_autoptr (GError) err = NULL;
++  const char *argv[] = { "systemctl", "start", "--no-block", unit, NULL };
++
++  g_message ("m52xq: starting %s", unit);
++  if (!g_spawn_async (NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err))
++    g_warning ("m52xq: could not start %s: %s", unit, err->message);
++}
++
++static gboolean
++m52xq_toggle_sim (guint slot)
++{
++  g_autofree char *mode = NULL;
++  const char *unit = NULL;
++
++  if (!g_file_test (M52XQ_SIM_MODE, G_FILE_TEST_IS_EXECUTABLE))
++    return FALSE;
++
++  if (g_file_test ("/etc/m52xq/flight", G_FILE_TEST_EXISTS)) {
++    /* SIMs off: turn on the SIM that was tapped ("only SIM n"; in flight mode m52xq-sim-mode only saves the choice),
++     * then leave flight mode, which applies the saved mode */
++    g_autoptr (GError) err = NULL;
++    const char *mode_unit = slot == 1 ? "m52xq-sim-mode@sim1.service" : "m52xq-sim-mode@sim2.service";
++    const char *argv[] = { "sh", "-c",
++                           "systemctl start \"$1\" && systemctl start --no-block m52xq-flight-mode@off.service",
++                           "m52xq-sim-on", mode_unit, NULL };
++
++    g_message ("m52xq: SIMs off, turning on SIM %u (%s, then flight mode off)", slot, mode_unit);
++    if (!g_spawn_async (NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL, NULL, &err))
++      g_warning ("m52xq: could not turn on SIM %u: %s", slot, err->message);
++    return TRUE;
++  }
++
++  if (!g_file_get_contents ("/etc/m52xq/sim-mode", &mode, NULL, NULL))
++    mode = g_strdup ("dsds");
++  g_strstrip (mode);
++
++  if (g_strcmp0 (mode, "sim1") == 0)
++    unit = slot == 2 ? "m52xq-sim-mode@dsds.service" : "m52xq-flight-mode@on.service"; /* last SIM: all SIMs off */
++  else if (g_strcmp0 (mode, "sim2") == 0)
++    unit = slot == 1 ? "m52xq-sim-mode@dsds.service" : "m52xq-flight-mode@on.service";
++  else
++    unit = slot == 1 ? "m52xq-sim-mode@sim2.service" : "m52xq-sim-mode@sim1.service";
++
++  if (unit)
++    m52xq_start_unit (unit);
++  else
++    g_message ("m52xq: SIM %u is the only active SIM, not turning it off", slot);
++  return TRUE;
++}
++
++static void
++on_wwan2_clicked (PhoshQuickSettings *self, PhoshQuickSetting *child)
++{
++  m52xq_toggle_sim (2);
++}
++
++#define M52XQ_FLIGHT_MODE "/usr/local/sbin/m52xq-flight-mode"
++#define M52XQ_FLIGHT_FLAG "/etc/m52xq/flight"
++
++/* m52xq: the flight mode tile shows the state of /etc/m52xq/flight (kept by m52xq-flight-mode) */
++static void
++m52xq_flight_update (PhoshQuickSettings *self)
++{
++  gboolean on = g_file_test (M52XQ_FLIGHT_FLAG, G_FILE_TEST_EXISTS);
++
++  phosh_status_icon_set_icon_name (self->m52xq_flight_info,
++                                   on ? "airplane-mode-symbolic" : "airplane-mode-disabled-symbolic");
++  phosh_status_icon_set_info (self->m52xq_flight_info, on ? "Flight mode on" : "Flight mode off");
++  phosh_quick_setting_set_active (self->m52xq_flight_qs, on);
++}
++
++static void
++on_m52xq_flight_changed (PhoshQuickSettings *self, GFile *file, GFile *other, GFileMonitorEvent event)
++{
++  g_autofree char *name = g_file_get_basename (file);
++
++  if (g_strcmp0 (name, "flight") == 0)
++    m52xq_flight_update (self);
++}
++
++static void
++on_m52xq_flight_clicked (PhoshQuickSettings *self, PhoshQuickSetting *child)
++{
++  /* cellular only: Wi-Fi and Bluetooth have their own tiles */
++  if (g_file_test (M52XQ_FLIGHT_FLAG, G_FILE_TEST_EXISTS))
++    m52xq_start_unit ("m52xq-flight-mode@off.service");
++  else
++    m52xq_start_unit ("m52xq-flight-mode@on.service");
++}
++
++static void
++m52xq_flight_init (PhoshQuickSettings *self)
++{
++  g_autoptr (GFile) dir = NULL;
++
++  if (!g_file_test (M52XQ_FLIGHT_MODE, G_FILE_TEST_IS_EXECUTABLE)) {
++    gtk_widget_set_visible (GTK_WIDGET (self->m52xq_flight_qs), FALSE);
++    return;
++  }
++
++  dir = g_file_new_for_path ("/etc/m52xq");
++  self->m52xq_flight_mon = g_file_monitor_directory (dir, G_FILE_MONITOR_NONE, NULL, NULL);
++  if (self->m52xq_flight_mon)
++    g_signal_connect_object (self->m52xq_flight_mon, "changed",
++                             G_CALLBACK (on_m52xq_flight_changed), self, G_CONNECT_SWAPPED);
++  m52xq_flight_update (self);
++}
++
++/*
++ * m52xq dual SIM: the SIM tiles stay visible when a SIM is off (so it can be turned on again), but a tile
++ * whose slot has no SIM card at all is hidden. Every modem object of ModemManager reports the SIM slots
++ * of the phone ("SimSlots": object path of the SIM in each slot, "/" for an empty slot). While no modem
++ * reports the slots (ModemManager restarting, SIM cards off) the tiles keep their last state.
++ */
++static void
++m52xq_slots_update (PhoshQuickSettings *self)
++{
++  g_autolist (GDBusObject) objects = NULL;
++  gboolean reported[2] = { FALSE, FALSE };
++  gboolean has_card[2] = { FALSE, FALSE };
++  PhoshQuickSetting *tiles[2] = { self->m52xq_sim1_qs, self->m52xq_sim2_qs };
++
++  if (!self->m52xq_mm)
++    return;
++
++  objects = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (self->m52xq_mm));
++  for (GList *l = objects; l; l = l->next) {
++    MMModem *modem = mm_object_peek_modem (MM_OBJECT (l->data));
++    g_autoptr (GVariant) slots = NULL;
++    gsize n;
++
++    if (!modem)
++      continue;
++    slots = g_dbus_proxy_get_cached_property (G_DBUS_PROXY (modem), "SimSlots");
++    if (!slots || !g_variant_is_of_type (slots, G_VARIANT_TYPE ("ao")))
++      continue;
++    n = g_variant_n_children (slots);
++    for (gsize i = 0; i < 2 && i < n; i++) {
++      g_autoptr (GVariant) path = g_variant_get_child_value (slots, i);
++
++      reported[i] = TRUE;
++      if (g_strcmp0 (g_variant_get_string (path, NULL), "/") != 0)
++        has_card[i] = TRUE;
++    }
++  }
++
++  for (guint i = 0; i < 2; i++) {
++    if (!reported[i] || !tiles[i])
++      continue;
++    if (gtk_widget_get_visible (GTK_WIDGET (tiles[i])) != has_card[i])
++      g_message ("m52xq: SIM slot %u %s, %s its tile", i + 1, has_card[i] ? "has a SIM card" : "is empty",
++                 has_card[i] ? "showing" : "hiding");
++    gtk_widget_set_visible (GTK_WIDGET (tiles[i]), has_card[i]);
++  }
++}
++
++static void
++on_m52xq_modem_props_changed (PhoshQuickSettings *self)
++{
++  m52xq_slots_update (self);
++}
++
++static void
++m52xq_slots_watch_object (PhoshQuickSettings *self, GDBusObject *object)
++{
++  MMModem *modem = mm_object_peek_modem (MM_OBJECT (object));
++
++  if (modem)
++    g_signal_connect_object (modem, "g-properties-changed",
++                             G_CALLBACK (on_m52xq_modem_props_changed), self, G_CONNECT_SWAPPED);
++}
++
++static void
++on_m52xq_mm_object_added (PhoshQuickSettings *self, GDBusObject *object)
++{
++  m52xq_slots_watch_object (self, object);
++  m52xq_slots_update (self);
++}
++
++static void
++on_m52xq_mm_ready (GObject *source, GAsyncResult *res, gpointer user_data)
++{
++  g_autoptr (GError) err = NULL;
++  g_autolist (GDBusObject) objects = NULL;
++  MMManager *mm = mm_manager_new_finish (res, &err);
++  PhoshQuickSettings *self;
++
++  if (!mm) {
++    if (!g_error_matches (err, G_IO_ERROR, G_IO_ERROR_CANCELLED))
++      g_warning ("m52xq: no ModemManager for the SIM slots: %s", err->message);
++    return;
++  }
++
++  self = PHOSH_QUICK_SETTINGS (user_data);
++  self->m52xq_mm = mm;
++  g_signal_connect_object (mm, "object-added", G_CALLBACK (on_m52xq_mm_object_added), self, G_CONNECT_SWAPPED);
++  g_signal_connect_object (mm, "object-removed", G_CALLBACK (m52xq_slots_update), self, G_CONNECT_SWAPPED);
++  objects = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (mm));
++  for (GList *l = objects; l; l = l->next)
++    m52xq_slots_watch_object (self, l->data);
++  m52xq_slots_update (self);
++}
++
++static void
++m52xq_slots_init (PhoshQuickSettings *self)
++{
++  g_autoptr (GDBusConnection) bus = g_bus_get_sync (G_BUS_TYPE_SYSTEM, NULL, NULL);
++
++  if (!bus)
++    return;
++  self->m52xq_mm_cancel = g_cancellable_new ();
++  mm_manager_new (bus, G_DBUS_OBJECT_MANAGER_CLIENT_FLAGS_DO_NOT_AUTO_START, self->m52xq_mm_cancel,
++                  on_m52xq_mm_ready, self);
++}
++
+ static void
+ on_wwan_clicked (PhoshQuickSettings *self, PhoshQuickSetting *child)
+ {
+@@ -55,6 +294,9 @@
+   PhoshWWan *wwan;
+   gboolean enabled;
+ 
++  if (m52xq_toggle_sim (1))
++    return;
++
+   wwan = phosh_shell_get_wwan (shell);
+   g_return_if_fail (PHOSH_IS_WWAN (wwan));
+ 
+@@ -126,8 +368,16 @@
+     phosh_rotation_manager_set_transform (rotation_manager, transform);
+     break;
+   case PHOSH_ROTATION_MANAGER_MODE_SENSOR:
++    /* m52xq: three states on one tile: automatic -> portrait -> landscape -> automatic */
+     locked = phosh_rotation_manager_get_orientation_locked (rotation_manager);
+-    phosh_rotation_manager_set_orientation_locked (rotation_manager, !locked);
++    if (!locked) {
++      phosh_rotation_manager_set_orientation_locked (rotation_manager, TRUE);
++      phosh_rotation_manager_set_transform (rotation_manager, PHOSH_MONITOR_TRANSFORM_NORMAL);
++    } else if (phosh_rotation_manager_get_transform (rotation_manager) == PHOSH_MONITOR_TRANSFORM_NORMAL) {
++      phosh_rotation_manager_set_transform (rotation_manager, PHOSH_MONITOR_TRANSFORM_270);
++    } else {
++      phosh_rotation_manager_set_orientation_locked (rotation_manager, FALSE);
++    }
+     break;
+   default:
+     g_assert_not_reached ();
+@@ -254,6 +504,10 @@
+ {
+   PhoshQuickSettings *self = PHOSH_QUICK_SETTINGS (object);
+ 
++  g_clear_object (&self->m52xq_flight_mon);
++  g_cancellable_cancel (self->m52xq_mm_cancel);
++  g_clear_object (&self->m52xq_mm_cancel);
++  g_clear_object (&self->m52xq_mm);
+   g_clear_object (&self->plugin_settings);
+   g_clear_object (&self->plugin_loader);
+   if (self->custom_quick_settings) {
+@@ -286,6 +540,12 @@
+   gtk_widget_class_bind_template_child (widget_class, PhoshQuickSettings, box);
+ 
+   gtk_widget_class_bind_template_callback (widget_class, on_wwan_clicked);
++  gtk_widget_class_bind_template_callback (widget_class, on_wwan2_clicked);
++  gtk_widget_class_bind_template_callback (widget_class, on_m52xq_flight_clicked);
++  gtk_widget_class_bind_template_child (widget_class, PhoshQuickSettings, m52xq_flight_qs);
++  gtk_widget_class_bind_template_child (widget_class, PhoshQuickSettings, m52xq_flight_info);
++  gtk_widget_class_bind_template_child (widget_class, PhoshQuickSettings, m52xq_sim1_qs);
++  gtk_widget_class_bind_template_child (widget_class, PhoshQuickSettings, m52xq_sim2_qs);
+   gtk_widget_class_bind_template_callback (widget_class, on_wifi_clicked);
+   gtk_widget_class_bind_template_callback (widget_class, on_bt_clicked);
+   gtk_widget_class_bind_template_callback (widget_class, on_battery_clicked);
+@@ -318,6 +578,9 @@
+                            G_CALLBACK (load_custom_quick_settings), self, G_CONNECT_SWAPPED);
+ 
+   load_custom_quick_settings (self, NULL, NULL);
++
++  m52xq_flight_init (self);
++  m52xq_slots_init (self);
+ }
+ 
+ 
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/rotateinfo.c phosh-0.58.0/src/rotateinfo.c
+--- a/src/rotateinfo.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/rotateinfo.c	2026-11-16 15:07:35.750680591 +0200
+@@ -68,7 +68,9 @@
+   gboolean monitor_is_landscape;
+   gboolean portrait;
+ 
+-  if (phosh_rotation_manager_get_mode (self->manager) != PHOSH_ROTATION_MANAGER_MODE_OFF)
++  /* m52xq: in sensor mode a locked orientation is shown as portrait / landscape too */
++  if (phosh_rotation_manager_get_mode (self->manager) != PHOSH_ROTATION_MANAGER_MODE_OFF &&
++      !phosh_rotation_manager_get_orientation_locked (self->manager))
+     return;
+ 
+   if (!monitor)
+@@ -118,6 +120,13 @@
+ 
+   g_debug ("Orientation locked: %d", locked);
+ 
++  if (locked) {
++    /* m52xq: locked = fixed portrait or landscape (three-state tile) */
++    on_transform_changed (self);
++    phosh_rotation_info_check_enabled (self);
++    return;
++  }
++
+   icon_name = locked ? "rotation-locked-symbolic" : "rotation-allowed-symbolic";
+   phosh_status_icon_set_icon_name (PHOSH_STATUS_ICON (self), icon_name);
+   /* Translators: Automatic screen orientation is either on (enabled) or off (locked/disabled) */
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/rotation-manager.c phosh-0.58.0/src/rotation-manager.c
+--- a/src/rotation-manager.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/rotation-manager.c	2026-11-16 15:07:56.630390160 +0200
+@@ -57,6 +57,11 @@
+   gboolean                 orientation_locked;
+ 
+   PhoshRotationManagerMode mode;
++
++  /* m52xq: self-healing accelerometer claim (phosh sometimes never claimed it after boot) */
++  guint                    m52xq_claim_watch_id;
++  char                    *m52xq_proxy_owner;
++  int                      m52xq_last_skip;   /* r101: last reason the watch skipped (logged once per change) */
+ } PhoshRotationManager;
+ 
+ G_DEFINE_TYPE (PhoshRotationManager, phosh_rotation_manager, G_TYPE_OBJECT);
+@@ -159,6 +164,7 @@
+     res, &err);
+ 
+   if (!success) {
++    /* m52xq: the 5 s watch (m52xq_claim_watch) claims again */
+     phosh_async_error_warn (err, "Failed to claim accelerometer");
+     return;
+   }
+@@ -166,7 +172,7 @@
+   g_return_if_fail (PHOSH_IS_ROTATION_MANAGER (self));
+   g_return_if_fail (sensor_proxy_manager == self->sensor_proxy_manager);
+ 
+-  g_debug ("Claimed accelerometer");
++  g_message ("m52xq: accelerometer claimed");
+   self->claimed = TRUE;
+   match_orientation (self);
+ }
+@@ -202,7 +208,7 @@
+   if (!self->sensor_proxy_manager)
+     return;
+ 
+-  g_debug ("Claiming accelerometer: %d", claim);
++  g_message ("m52xq: %s accelerometer", claim ? "claiming" : "releasing");
+   if (claim) {
+     phosh_dbus_sensor_proxy_call_claim_accelerometer (
+       PHOSH_DBUS_SENSOR_PROXY (self->sensor_proxy_manager),
+@@ -466,6 +472,111 @@
+   }
+ }
+ 
++/*
++ * m52xq: phosh claims the accelerometer only on events (sensor appears, blank state or orientation lock
++ * changes). After some boots it never claimed it (auto rotation dead until a new login, 2026-11-13 and
++ * 2026-11-15). Check every 5 s: automatic rotation wanted, screen not blanked, not claimed -> claim.
++ * A restart of iio-sensor-proxy (new bus name owner) drops all claims: claim again.
++ */
++/* m52xq r101: ask iio-sensor-proxy itself whether there is an accelerometer. The cached property of the proxy stayed
++ * FALSE when the ADSP accelerometer appeared ~1 s after phosh had started (first boot after an install, fast login), so
++ * phosh never switched to the sensor mode and the r100 watch, which read the same cache, stayed silent. */
++static gboolean
++m52xq_has_accelerometer_now (PhoshRotationManager *self)
++{
++  g_autoptr (GError) err = NULL;
++  g_autoptr (GVariant) reply = NULL;
++  g_autoptr (GVariant) value = NULL;
++  gboolean has;
++
++  reply = g_dbus_proxy_call_sync (G_DBUS_PROXY (self->sensor_proxy_manager),
++                                  "org.freedesktop.DBus.Properties.Get",
++                                  g_variant_new ("(ss)", "net.hadess.SensorProxy", "HasAccelerometer"),
++                                  G_DBUS_CALL_FLAGS_NONE, 1000, NULL, &err);
++  if (!reply) {
++    g_message ("m52xq: cannot ask iio-sensor-proxy for the accelerometer: %s", err->message);
++    return FALSE;
++  }
++  g_variant_get (reply, "(v)", &value);
++  has = g_variant_is_of_type (value, G_VARIANT_TYPE_BOOLEAN) && g_variant_get_boolean (value);
++  if (has && !phosh_dbus_sensor_proxy_get_has_accelerometer (PHOSH_DBUS_SENSOR_PROXY (self->sensor_proxy_manager))) {
++    g_message ("m52xq: iio-sensor-proxy has an accelerometer but the cached property says no: updating the cache");
++    g_dbus_proxy_set_cached_property (G_DBUS_PROXY (self->sensor_proxy_manager), "HasAccelerometer",
++                                      g_variant_new_boolean (TRUE));
++  }
++  return has;
++}
++
++static void
++m52xq_watch_skip (PhoshRotationManager *self, int reason, const char *text)
++{
++  if (self->m52xq_last_skip == reason)
++    return;
++  self->m52xq_last_skip = reason;
++  if (text)
++    g_message ("m52xq: rotation watch: %s", text);
++}
++
++/*
++ * m52xq: phosh claims the accelerometer only on events (sensor appears, blank state or orientation lock
++ * changes). After some boots it never claimed it (auto rotation dead until a new login, 2026-11-13, 2026-11-15 and
++ * 2026-11-16 after the install of v6). Every 5 s: automatic rotation wanted, screen not blanked, not claimed -> claim.
++ * A restart of iio-sensor-proxy (new bus name owner) drops all claims: claim again.
++ */
++static gboolean
++m52xq_claim_watch (gpointer data)
++{
++  PhoshRotationManager *self = PHOSH_ROTATION_MANAGER (data);
++  gboolean blanked = !!(phosh_shell_get_state (phosh_shell_get_default ()) & PHOSH_STATE_BLANKED);
++
++  if (self->claimed) {
++    m52xq_watch_skip (self, 0, NULL);
++    return G_SOURCE_CONTINUE;
++  }
++  if (!self->sensor_proxy_manager) {
++    m52xq_watch_skip (self, 1, "no sensor proxy");
++    return G_SOURCE_CONTINUE;
++  }
++  if (self->orientation_locked) {
++    m52xq_watch_skip (self, 2, "orientation locked, not claiming");
++    return G_SOURCE_CONTINUE;
++  }
++  if (blanked) {
++    m52xq_watch_skip (self, 3, "screen blanked, not claiming");
++    return G_SOURCE_CONTINUE;
++  }
++  if (!m52xq_has_accelerometer_now (self)) {
++    m52xq_watch_skip (self, 4, "no accelerometer in iio-sensor-proxy yet");
++    return G_SOURCE_CONTINUE;
++  }
++  m52xq_watch_skip (self, 5, NULL);
++  if (self->mode == PHOSH_ROTATION_MANAGER_MODE_OFF) {
++    g_message ("m52xq: accelerometer present but rotation mode off, enabling sensor mode");
++    phosh_rotation_manager_set_mode (self, PHOSH_ROTATION_MANAGER_MODE_SENSOR);
++  } else {
++    g_message ("m52xq: accelerometer not claimed while rotation is automatic, claiming again");
++    phosh_rotation_manager_claim_accelerometer (self, TRUE);
++  }
++  return G_SOURCE_CONTINUE;
++}
++
++static void
++m52xq_on_proxy_owner_changed (PhoshRotationManager *self)
++{
++  g_autofree char *owner = g_dbus_proxy_get_name_owner (G_DBUS_PROXY (self->sensor_proxy_manager));
++
++  if (g_strcmp0 (owner, self->m52xq_proxy_owner) == 0)
++    return;
++
++  g_message ("m52xq: iio-sensor-proxy owner %s -> %s", self->m52xq_proxy_owner ?: "-", owner ?: "-");
++  g_free (self->m52xq_proxy_owner);
++  self->m52xq_proxy_owner = g_strdup (owner);
++  /* claims belong to the old instance: forget ours, the watch claims again */
++  self->claimed = FALSE;
++  if (owner)
++    claim_or_release_accelerometer (self);
++}
++
+ static void
+ phosh_rotation_manager_constructed (GObject *object)
+ {
+@@ -507,6 +618,12 @@
+                             (GCallback) on_has_accelerometer_changed,
+                             self);
+   on_has_accelerometer_changed (self, NULL, self->sensor_proxy_manager);
++
++  /* m52xq */
++  self->m52xq_proxy_owner = g_dbus_proxy_get_name_owner (G_DBUS_PROXY (self->sensor_proxy_manager));
++  g_signal_connect_swapped (self->sensor_proxy_manager, "notify::g-name-owner",
++                            (GCallback) m52xq_on_proxy_owner_changed, self);
++  self->m52xq_claim_watch_id = g_timeout_add_seconds (5, m52xq_claim_watch, self);
+ }
+ 
+ 
+@@ -515,6 +632,8 @@
+ {
+   PhoshRotationManager *self = PHOSH_ROTATION_MANAGER (object);
+ 
++  g_clear_handle_id (&self->m52xq_claim_watch_id, g_source_remove);
++  g_clear_pointer (&self->m52xq_proxy_owner, g_free);
+   g_cancellable_cancel (self->cancel);
+   g_clear_object (&self->cancel);
+ 
+@@ -700,7 +819,8 @@
+                                       PhoshMonitorTransform  transform)
+ {
+   g_return_if_fail (PHOSH_IS_ROTATION_MANAGER (self));
+-  g_return_if_fail (self->mode == PHOSH_ROTATION_MANAGER_MODE_OFF);
++  /* m52xq: also with the sensor when the orientation is locked (three-state rotation tile) */
++  g_return_if_fail (self->mode == PHOSH_ROTATION_MANAGER_MODE_OFF || self->orientation_locked);
+ 
+   apply_transform (self, transform);
+ }
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/shell.c phosh-0.58.0/src/shell.c
+--- a/src/shell.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/shell.c	2026-11-16 15:07:35.750680591 +0200
+@@ -178,6 +178,7 @@
+   PhoshBtManager             *bt_manager;
+   PhoshMountManager          *mount_manager;
+   PhoshWWan                  *wwan;
++  PhoshWWan                  *wwan2;   /* m52xq dual SIM: the modem of SIM 2 */
+   PhoshTorchManager          *torch_manager;
+   PhoshModeManager           *mode_manager;
+   PhoshDockedManager         *docked_manager;
+@@ -618,6 +619,7 @@
+   g_clear_object (&priv->torch_manager);
+   g_clear_object (&priv->gnome_shell_manager);
+   g_clear_object (&priv->wwan);
++  g_clear_object (&priv->wwan2);
+   g_clear_object (&priv->mount_manager);
+   g_clear_object (&priv->battery_manager);
+   g_clear_object (&priv->bt_manager);
+@@ -2296,7 +2298,8 @@
+     switch (backend) {
+       default:
+       case PHOSH_WWAN_BACKEND_MM:
+-        priv->wwan = PHOSH_WWAN (phosh_wwan_mm_new());
++        /* m52xq dual SIM: the main WWAN is the modem of SIM 1 (or the only modem) */
++        priv->wwan = PHOSH_WWAN (phosh_wwan_mm_new_for_slot (1));
+         break;
+       case PHOSH_WWAN_BACKEND_OFONO:
+         priv->wwan = PHOSH_WWAN (phosh_wwan_ofono_new());
+@@ -2309,6 +2312,29 @@
+ }
+ 
+ /**
++ * phosh_shell_get_wwan2:
++ * @self: The shell singleton
++ *
++ * m52xq dual SIM: the WWAN of the modem of SIM 2 (ModemManager backend). It stays
++ * not present while there is no "SIM 2" modem.
++ *
++ * Returns: (transfer none): The WWAN of SIM 2
++ */
++PhoshWWan *
++phosh_shell_get_wwan2 (PhoshShell *self)
++{
++  PhoshShellPrivate *priv;
++
++  g_return_val_if_fail (PHOSH_IS_SHELL (self), NULL);
++  priv = phosh_shell_get_instance_private (self);
++
++  if (!priv->wwan2)
++    priv->wwan2 = PHOSH_WWAN (phosh_wwan_mm_new_for_slot (2));
++
++  return priv->wwan2;
++}
++
++/**
+  * phosh_shell_get_usable_area:
+  * @self: The shell
+  * @x:(out)(nullable): The x coordinate where client usable area starts
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/ui/quick-settings.ui phosh-0.58.0/src/ui/quick-settings.ui
+--- a/src/ui/quick-settings.ui	2026-10-04 15:01:58.000000000 +0300
++++ b/src/ui/quick-settings.ui	2026-11-16 15:07:35.750680591 +0200
+@@ -8,15 +8,33 @@
+         <property name="visible">1</property>
+         <property name="spacing">6</property>
+         <child>
+-          <object class="PhoshQuickSetting">
++          <object class="PhoshQuickSetting" id="m52xq_sim1_qs">
+             <property name="visible">1</property>
+-            <property name="sensitive" bind-source="wwaninfo" bind-property="present" bind-flags="sync-create"/>
++            <!-- m52xq dual SIM: not bound to "present", SIM 1 that is off must stay tappable -->
+             <property name="status-icon">wwaninfo</property>
+             <property name="long-press-action-name">panel.launch-mobile-panel</property>
+             <property name="long-press-action-target">(&quot;wwan&quot;, [&lt;&quot;&quot;&gt;])</property>
+             <signal name="clicked" handler="on_wwan_clicked" object="PhoshQuickSettings" swapped="yes"/>
+           </object>
+         </child>
++        <!-- m52xq dual SIM: SIM 2; shown so a SIM that is off can be turned on again, hidden when its slot is empty -->
++        <child>
++          <object class="PhoshQuickSetting" id="m52xq_sim2_qs">
++            <property name="visible">1</property>
++            <property name="status-icon">wwaninfo2</property>
++            <property name="long-press-action-name">panel.launch-mobile-panel</property>
++            <property name="long-press-action-target">(&quot;wwan&quot;, [&lt;&quot;&quot;&gt;])</property>
++            <signal name="clicked" handler="on_wwan2_clicked" object="PhoshQuickSettings" swapped="yes"/>
++          </object>
++        </child>
++        <!-- m52xq: cellular flight mode (SIM cards and modem radio off) -->
++        <child>
++          <object class="PhoshQuickSetting" id="m52xq_flight_qs">
++            <property name="visible">1</property>
++            <property name="status-icon">m52xq_flight_info</property>
++            <signal name="clicked" handler="on_m52xq_flight_clicked" object="PhoshQuickSettings" swapped="yes"/>
++          </object>
++        </child>
+         <child>
+           <object class="PhoshQuickSetting">
+             <property name="visible">1</property>
+@@ -102,6 +120,17 @@
+     <property name="visible">1</property>
+     <property name="pixel-size">16</property>
+   </object>
++  <object class="PhoshStatusIcon" id="m52xq_flight_info">
++    <property name="visible">1</property>
++    <property name="pixel-size">16</property>
++    <property name="icon-name">airplane-mode-disabled-symbolic</property>
++    <property name="info">Flight mode off</property>
++  </object>
++  <object class="PhoshWWanInfo" id="wwaninfo2">
++    <property name="slot">2</property>
++    <property name="visible">1</property>
++    <property name="pixel-size">16</property>
++  </object>
+   <object class="PhoshWifiInfo" id="wifiinfo">
+     <property name="visible">1</property>
+     <property name="pixel-size">16</property>
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/ui/top-panel.ui phosh-0.58.0/src/ui/top-panel.ui
+--- a/src/ui/top-panel.ui	2026-10-04 15:01:58.000000000 +0300
++++ b/src/ui/top-panel.ui	2026-11-16 15:07:35.750680591 +0200
+@@ -228,6 +228,14 @@
+                             <property name="child">wwaninfo</property>
+                           </object>
+                         </child>
++                        <!-- m52xq dual SIM: SIM 2 -->
++                        <child>
++                          <object class="PhoshRevealer">
++                            <property name="visible">1</property>
++                            <property name="show-child" bind-source="wwaninfo2" bind-property="present" bind-flags="sync-create"/>
++                            <property name="child">wwaninfo2</property>
++                          </object>
++                        </child>
+                         <child>
+                           <object class="PhoshRevealer">
+                             <property name="visible">1</property>
+@@ -266,16 +274,7 @@
+                       </object>
+                       <!-- box_network -->
+                     </child>
+-                    <child type="center">
+-                      <object class="GtkLabel" id="lbl_clock">
+-                        <property name="visible">1</property>
+-                        <property name="margin-top">2</property>
+-                        <property name="label">00:00</property>
+-                        <style>
+-                          <class name="phosh-topbar-clock"/>
+-                        </style>
+-                      </object>
+-                    </child>
++                    <!-- m52xq: the clock moved to the right, after the battery -->
+                     <child>
+                       <object class="GtkBox" id="box_indicators">
+                         <property name="visible">1</property>
+@@ -322,12 +321,26 @@
+                                 <property name="child">location_info</property>
+                               </object>
+                             </child>
+-                            <child>
+-                              <object class="PhoshBatteryInfo" id="batteryinfo">
+-                                <property name="visible">1</property>
+-                                <property name="pixel-size">16</property>
+-                              </object>
+-                            </child>
++                          </object>
++                        </child>
++                        <!-- m52xq: the clock after the status icons, right of the battery -->
++                        <child>
++                          <object class="GtkLabel" id="lbl_clock">
++                            <property name="visible">1</property>
++                            <property name="margin-top">2</property>
++                            <property name="margin-start">8</property>
++                            <property name="label">00:00</property>
++                            <style>
++                              <class name="phosh-topbar-clock"/>
++                            </style>
++                          </object>
++                        </child>
++                        <!-- m52xq: the battery is the last item, right of the clock -->
++                        <child>
++                          <object class="PhoshBatteryInfo" id="batteryinfo">
++                            <property name="visible">1</property>
++                            <property name="margin-start">8</property>
++                            <property name="pixel-size">16</property>
+                           </object>
+                         </child>
+                       </object>
+@@ -401,6 +414,15 @@
+     <property name="margin-end">8</property>
+     <property name="pixel-size">16</property>
+     <property name="show-detail">1</property>
++    <style>
++      <class name="phosh-wwan-indicator"/>
++    </style>
++  </object>
++  <object class="PhoshWWanInfo" id="wwaninfo2">
++    <property name="slot">2</property>
++    <property name="margin-end">8</property>
++    <property name="pixel-size">16</property>
++    <property name="show-detail">1</property>
+     <style>
+       <class name="phosh-wwan-indicator"/>
+     </style>
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/wwan/phosh-wwan-mm.c phosh-0.58.0/src/wwan/phosh-wwan-mm.c
+--- a/src/wwan/phosh-wwan-mm.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/wwan/phosh-wwan-mm.c	2026-11-16 15:07:35.750680591 +0200
+@@ -37,6 +37,7 @@
+   PROP_PRESENT,
+   PROP_ENABLED,
+   PROP_OPERATOR,
++  PROP_SLOT,
+   PROP_LAST_PROP,
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+@@ -62,6 +63,9 @@
+   char                           *operator;
+ 
+   GListStore                     *cbms;
++
++  /* m52xq dual SIM: 0 = first modem (upstream behaviour), 1 / 2 = the modem of that SIM slot */
++  guint                           slot;
+ } PhoshWWanMM;
+ 
+ 
+@@ -285,6 +289,9 @@
+   case PROP_OPERATOR:
+     g_value_set_string (value, self->operator);
+     break;
++  case PROP_SLOT:
++    g_value_set_uint (value, self->slot);
++    break;
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -521,10 +528,64 @@
+ }
+ 
+ 
++/*
++ * m52xq dual SIM: with both SIMs active ModemManager has one modem object per SIM, named "SIM 1" / "SIM 2"
++ * (model of our ModemManager build). Slot 2 takes only "SIM 2"; slot 1 takes "SIM 1" or a modem without
++ * a SIM name (single SIM); slot 0 is the upstream behaviour (the first modem).
++ */
++static gboolean
++object_matches_slot (PhoshWWanMM *self, GDBusObject *object)
++{
++  g_autoptr (MMModem) modem = NULL;
++  const char *model;
++
++  if (self->slot == 0)
++    return TRUE;
++
++  modem = mm_object_get_modem (MM_OBJECT (object));
++  if (!modem)
++    return FALSE;
++
++  model = mm_modem_get_model (modem);
++  if (self->slot == 2)
++    return g_strcmp0 (model, "SIM 2") == 0;
++
++  return g_strcmp0 (model, "SIM 2") != 0 && model && *model;
++}
++
++static void on_mm_object_added (PhoshWWanMM *self, GDBusObject *object, MMManager *manager);
++
++static void
++on_pending_modem_model_changed (PhoshWWanMM *self, GParamSpec *pspec, MMModem *modem)
++{
++  GDBusObject *object;
++
++  if (self->object || !self->manager)
++    return;
++
++  object = g_dbus_object_manager_get_object (G_DBUS_OBJECT_MANAGER (self->manager),
++                                             g_dbus_proxy_get_object_path (G_DBUS_PROXY (modem)));
++  if (object) {
++    on_mm_object_added (self, object, self->manager);
++    g_object_unref (object);
++  }
++}
++
+ static void
+ on_mm_object_added (PhoshWWanMM *self, GDBusObject *object, MMManager *manager)
+ {
+-  g_debug ("Modem added at path: %s", g_dbus_object_get_object_path (object));
++  g_debug ("Modem added at path: %s (slot %u)", g_dbus_object_get_object_path (object), self->slot);
++
++  if (!self->object && !object_matches_slot (self, object)) {
++    MMModem *modem = mm_object_peek_modem (MM_OBJECT (object));
++
++    /* the model may still be loading: look again when it changes */
++    if (modem)
++      g_signal_connect_object (modem, "notify::model",
++                               G_CALLBACK (on_pending_modem_model_changed),
++                               self, G_CONNECT_SWAPPED);
++    return;
++  }
+ 
+   if (!self->object) {
+     g_debug ("Tracking modem at: %s", g_dbus_object_get_object_path (object));
+@@ -553,8 +614,17 @@
+   g_debug ("Modem removed at path: %s", g_dbus_object_get_object_path (object));
+ 
+   if (self->object == MM_OBJECT (object)) {
++    g_autolist (GDBusObject) modems = NULL;
++
+     g_debug ("Dropping modem at: %s", g_dbus_object_get_object_path (object));
+     phosh_wwan_mm_destroy_modem (self);
++
++    /* m52xq: take another matching modem if there is one (upstream stayed without a modem) */
++    modems = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (manager));
++    for (GList *l = modems; l && !self->object; l = l->next) {
++      if (l->data != (gpointer) object)
++        on_mm_object_added (self, l->data, manager);
++    }
+   }
+ }
+ 
+@@ -587,8 +657,9 @@
+ 
+   modems = g_dbus_object_manager_get_objects (G_DBUS_OBJECT_MANAGER (self->manager));
+   if (modems) {
+-    /* Cold plug first modem */
+-    on_mm_object_added (self, modems->data, self->manager);
++    /* Cold plug the first (matching) modem */
++    for (GList *l = modems; l && !self->object; l = l->next)
++      on_mm_object_added (self, l->data, self->manager);
+   } else {
+     g_debug ("No modem found");
+   }
+@@ -617,10 +688,31 @@
+ 
+ 
+ static void
++phosh_wwan_mm_set_property (GObject      *object,
++                            guint         property_id,
++                            const GValue *value,
++                            GParamSpec   *pspec)
++{
++  PhoshWWanMM *self = PHOSH_WWAN_MM (object);
++
++  switch (property_id) {
++  case PROP_SLOT:
++    self->slot = g_value_get_uint (value);
++    break;
++  default:
++    G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
++    break;
++  }
++}
++
++
++static void
+ phosh_wwan_mm_class_init (PhoshWWanMMClass *klass)
+ {
+   GObjectClass *object_class = G_OBJECT_CLASS (klass);
+ 
++  object_class->set_property = phosh_wwan_mm_set_property;
++
+   object_class->dispose = phosh_wwan_mm_dispose;
+   object_class->get_property = phosh_wwan_mm_get_property;
+ 
+@@ -644,6 +736,11 @@
+ 
+   g_object_class_override_property (object_class, PROP_OPERATOR, "operator");
+   props[PROP_OPERATOR] = g_object_class_find_property (object_class, "operator");
++
++  /* m52xq dual SIM */
++  props[PROP_SLOT] = g_param_spec_uint ("slot", "", "", 0, 2, 0,
++                                        G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY | G_PARAM_STATIC_STRINGS);
++  g_object_class_install_property (object_class, PROP_SLOT, props[PROP_SLOT]);
+ }
+ 
+ 
+@@ -790,3 +887,26 @@
+ {
+   return g_object_new (PHOSH_TYPE_WWAN_MM, NULL);
+ }
++
++
++PhoshWWanMM *
++phosh_wwan_mm_new_for_slot (guint slot)
++{
++  return g_object_new (PHOSH_TYPE_WWAN_MM, "slot", slot, NULL);
++}
++
++
++guint
++phosh_wwan_mm_get_slot (PhoshWWanMM *self)
++{
++  g_return_val_if_fail (PHOSH_IS_WWAN_MM (self), 0);
++  return self->slot;
++}
++
++
++const char *
++phosh_wwan_mm_get_primary_port (PhoshWWanMM *self)
++{
++  g_return_val_if_fail (PHOSH_IS_WWAN_MM (self), NULL);
++  return self->modem ? mm_modem_get_primary_port (self->modem) : NULL;
++}
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/wwan/phosh-wwan-mm.h phosh-0.58.0/src/wwan/phosh-wwan-mm.h
+--- a/src/wwan/phosh-wwan-mm.h	2026-10-04 15:01:58.000000000 +0300
++++ b/src/wwan/phosh-wwan-mm.h	2026-11-16 15:07:35.750680591 +0200
+@@ -16,5 +16,8 @@
+ G_DECLARE_FINAL_TYPE (PhoshWWanMM, phosh_wwan_mm, PHOSH, WWAN_MM, PhoshWWanManager)
+ 
+ PhoshWWanMM * phosh_wwan_mm_new                (void);
++PhoshWWanMM * phosh_wwan_mm_new_for_slot       (guint slot);
++guint         phosh_wwan_mm_get_slot           (PhoshWWanMM *self);
++const char *  phosh_wwan_mm_get_primary_port   (PhoshWWanMM *self);
+ 
+ G_END_DECLS
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/wwan/wwan-manager.c phosh-0.58.0/src/wwan/wwan-manager.c
+--- a/src/wwan/wwan-manager.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/wwan/wwan-manager.c	2026-11-16 15:07:35.750680591 +0200
+@@ -499,6 +499,29 @@
+   return !!priv->active;
+ }
+ 
++/*
++ * m52xq dual SIM: the interface (ModemManager primary port, "qrtr0" / "qrtr0-sim2") of the device
++ * carrying the active mobile data connection, so only that SIM shows the data arrows.
++ */
++const char *
++phosh_wwan_manager_get_data_iface (PhoshWWanManager *self)
++{
++  PhoshWWanManagerPrivate *priv;
++  const GPtrArray *devs;
++
++  g_return_val_if_fail (PHOSH_IS_WWAN_MANAGER (self), NULL);
++  priv = phosh_wwan_manager_get_instance_private (self);
++
++  if (!priv->active)
++    return NULL;
++
++  devs = nm_active_connection_get_devices (priv->active);
++  if (!devs || devs->len == 0)
++    return NULL;
++
++  return nm_device_get_iface (NM_DEVICE (g_ptr_array_index (devs, 0)));
++}
++
+ /**
+  * phosh_wwan_manager_set_data_enabled:
+  * @self: The wwan manager
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/wwan/wwan-manager.h phosh-0.58.0/src/wwan/wwan-manager.h
+--- a/src/wwan/wwan-manager.h	2026-10-04 15:01:58.000000000 +0300
++++ b/src/wwan/wwan-manager.h	2026-11-16 15:07:35.754680535 +0200
+@@ -21,6 +21,7 @@
+ PhoshWWanManager  *phosh_wwan_manager_new (void);
+ void               phosh_wwan_manager_set_enabled (PhoshWWanManager *self, gboolean enabled);
+ gboolean           phosh_wwan_manager_get_data_enabled (PhoshWWanManager *self);
++const char        *phosh_wwan_manager_get_data_iface (PhoshWWanManager *self);
+ void               phosh_wwan_manager_set_data_enabled (PhoshWWanManager *self, gboolean enabled);
+ gboolean           phosh_wwan_manager_has_data (PhoshWWanManager *self);
+ 
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/src/wwan-info.c phosh-0.58.0/src/wwan-info.c
+--- a/src/wwan-info.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/wwan-info.c	2026-11-16 15:07:35.754680535 +0200
+@@ -13,6 +13,7 @@
+ #include "phosh-config.h"
+ #include "wwan-info.h"
+ #include "wwan/wwan-manager.h"
++#include "wwan/phosh-wwan-mm.h"
+ 
+ #include "shell-priv.h"
+ 
+@@ -30,6 +31,7 @@
+   PROP_SHOW_DETAIL,
+   PROP_PRESENT,
+   PROP_ENABLED,
++  PROP_SLOT,
+   PROP_LAST_PROP,
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+@@ -40,6 +42,8 @@
+   PhoshStatusIcon  parent;
+ 
+   PhoshWWan       *wwan;
++  PhoshWWan       *other;   /* m52xq dual SIM: the WWAN of the other SIM (labels only when both are present) */
++  guint            slot;    /* 0 = main WWAN (SIM 1 or the only modem), 2 = SIM 2 */
+   gboolean         present;
+   gboolean         enabled;
+   gboolean         show_detail;
+@@ -59,6 +63,9 @@
+   case PROP_SHOW_DETAIL:
+     phosh_wwan_info_set_show_detail (self, g_value_get_boolean (value));
+     break;
++  case PROP_SLOT:
++    self->slot = g_value_get_uint (value);
++    break;
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -84,6 +91,9 @@
+   case PROP_ENABLED:
+     g_value_set_boolean (value, self->enabled);
+     break;
++  case PROP_SLOT:
++    g_value_set_uint (value, self->slot);
++    break;
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -135,6 +145,17 @@
+ }
+ 
+ 
++/* m52xq dual SIM: number shown next to the icon when both SIM modems are present, 0 otherwise */
++static guint
++shown_slot (PhoshWWanInfo *self)
++{
++  if (!self->other || !phosh_wwan_is_present (self->wwan) || !phosh_wwan_is_present (self->other))
++    return 0;
++  return self->slot == 2 ? 2 : 1;
++}
++
++static void update_info (PhoshWWanInfo *self);
++
+ static void
+ update_icon_data(PhoshWWanInfo *self, GParamSpec *psepc, PhoshWWan *wwan)
+ {
+@@ -150,6 +171,7 @@
+   if (present != self->present) {
+     self->present = present;
+     g_object_notify_by_pspec (G_OBJECT (self), props[PROP_PRESENT]);
++    update_info (self);   /* m52xq dual SIM: "SIM n: Off" label */
+   }
+ 
+   access_tec_widget = phosh_status_icon_get_extra_widget (PHOSH_STATUS_ICON (self));
+@@ -179,6 +201,14 @@
+   /* Signal quality */
+   quality = phosh_wwan_get_signal_quality (self->wwan);
+   data_enabled = phosh_wwan_manager_get_data_enabled (PHOSH_WWAN_MANAGER (self->wwan));
++  /* m52xq dual SIM: the data arrows only on the SIM whose modem carries the data connection */
++  if (data_enabled && shown_slot (self) && PHOSH_IS_WWAN_MM (self->wwan)) {
++    const char *iface = phosh_wwan_manager_get_data_iface (PHOSH_WWAN_MANAGER (self->wwan));
++    const char *port = phosh_wwan_mm_get_primary_port (PHOSH_WWAN_MM (self->wwan));
++
++    if (iface && port && g_strcmp0 (iface, port) != 0)
++      data_enabled = FALSE;
++  }
+   icon_name = signal_quality_icon_name (quality, data_enabled);
+   phosh_status_icon_set_icon_name (PHOSH_STATUS_ICON (self), icon_name);
+ 
+@@ -194,7 +224,13 @@
+     return;
+   }
+ 
+-  gtk_label_set_text (GTK_LABEL (access_tec_widget), access_tec);
++  if (shown_slot (self)) {
++    g_autofree char *text = g_strdup_printf ("%u %s", shown_slot (self), access_tec);
++
++    gtk_label_set_text (GTK_LABEL (access_tec_widget), text);
++  } else {
++    gtk_label_set_text (GTK_LABEL (access_tec_widget), access_tec);
++  }
+   gtk_widget_set_visible (access_tec_widget, TRUE);
+ }
+ 
+@@ -210,9 +246,30 @@
+     info = _("Cellular");
+   }
+ 
++  /* m52xq dual SIM: "SIM n: <operator>", or "SIM n: Off" when the other SIM is there and this one is not */
++  if (self->other && (phosh_wwan_is_present (self->wwan) || phosh_wwan_is_present (self->other))) {
++    guint n = self->slot == 2 ? 2 : 1;
++    g_autofree char *text = NULL;
++
++    if (phosh_wwan_is_present (self->wwan))
++      text = g_strdup_printf ("SIM %u: %s", n, info);
++    else
++      /* Translators: a SIM card that is turned off */
++      text = g_strdup_printf ("SIM %u: %s", n, C_("sim-card-off", "Off"));
++    phosh_status_icon_set_info (PHOSH_STATUS_ICON (self), text);
++    return;
++  }
+   phosh_status_icon_set_info (PHOSH_STATUS_ICON (self), info);
+ }
+ 
++/* m52xq dual SIM: the other SIM appeared / went away -> labels on or off */
++static void
++on_other_present_changed (PhoshWWanInfo *self)
++{
++  update_icon_data (self, NULL, NULL);
++  update_info (self);
++}
++
+ 
+ static void
+ phosh_wwan_info_idle_init (PhoshStatusIcon *icon)
+@@ -240,7 +297,17 @@
+ 
+   G_OBJECT_CLASS (phosh_wwan_info_parent_class)->constructed (object);
+ 
+-  self->wwan = g_object_ref (phosh_shell_get_wwan (phosh_shell_get_default ()));
++  if (self->slot == 2) {
++    self->wwan = g_object_ref (phosh_shell_get_wwan2 (phosh_shell_get_default ()));
++    self->other = g_object_ref (phosh_shell_get_wwan (phosh_shell_get_default ()));
++  } else {
++    self->wwan = g_object_ref (phosh_shell_get_wwan (phosh_shell_get_default ()));
++    if (PHOSH_IS_WWAN_MM (self->wwan))
++      self->other = g_object_ref (phosh_shell_get_wwan2 (phosh_shell_get_default ()));
++  }
++  if (self->other)
++    g_signal_connect_swapped (self->other, "notify::present",
++                              G_CALLBACK (on_other_present_changed), self);
+ 
+   for (int i = 0; i < g_strv_length(signals); i++) {
+     g_signal_connect_swapped (self->wwan, signals[i],
+@@ -264,6 +331,10 @@
+     g_signal_handlers_disconnect_by_data (self->wwan, self);
+     g_clear_object (&self->wwan);
+   }
++  if (self->other) {
++    g_signal_handlers_disconnect_by_data (self->other, self);
++    g_clear_object (&self->other);
++  }
+ 
+   G_OBJECT_CLASS (phosh_wwan_info_parent_class)->dispose (object);
+ }
+@@ -315,6 +386,15 @@
+                           FALSE,
+                           G_PARAM_READABLE | G_PARAM_STATIC_STRINGS);
+ 
++  /**
++   * PhoshWWanInfo:slot:
++   *
++   * m52xq dual SIM: 0 = the main WWAN (SIM 1 or the only modem), 2 = the modem of SIM 2
++   */
++  props[PROP_SLOT] =
++    g_param_spec_uint ("slot", "", "", 0, 2, 0,
++                       G_PARAM_CONSTRUCT_ONLY | G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
++
+   g_object_class_install_properties (object_class, PROP_LAST_PROP, props);
+ }
+ 
+diff -ruN -x .git -x gvc orig/phosh-0.58.0/subprojects/libcall-ui/src/cui-call-display.c phosh-0.58.0/subprojects/libcall-ui/src/cui-call-display.c
+--- a/subprojects/libcall-ui/src/cui-call-display.c	2025-11-08 22:30:48.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call-display.c	2026-11-16 15:07:35.754680535 +0200
+@@ -126,6 +126,25 @@
+ }
+ 
+ 
++/* m52xq: the mute / speaker toggles show their state clearly (accent colour; mute also changes its icon):
++ * on the green call screen of the lock screen the checked style was invisible */
++static void
++m52xq_toggle_style (GtkToggleButton *button, const char *icon_on, const char *icon_off)
++{
++  gboolean on = gtk_toggle_button_get_active (button);
++  GtkWidget *child = gtk_bin_get_child (GTK_BIN (button));   /* GTK 3 (Phosh's copy of libcall-ui) */
++  GtkStyleContext *ctx = gtk_widget_get_style_context (GTK_WIDGET (button));
++
++  if (on)
++    gtk_style_context_add_class (ctx, "suggested-action");
++  else
++    gtk_style_context_remove_class (ctx, "suggested-action");
++  if (icon_on && GTK_IS_IMAGE (child))
++    gtk_image_set_from_icon_name (GTK_IMAGE (child), on ? icon_on : icon_off, GTK_ICON_SIZE_BUTTON);
++}
++
++#define M52XQ_MUTE_ICONS "microphone-sensitivity-muted-symbolic", "audio-input-microphone-symbolic"
++
+ static void
+ mute_toggled_cb (GtkToggleButton *togglebutton,
+                  CuiCallDisplay  *self)
+@@ -133,6 +152,7 @@
+   gboolean want_mute;
+ 
+   want_mute = gtk_toggle_button_get_active (togglebutton);
++  m52xq_toggle_style (togglebutton, M52XQ_MUTE_ICONS);
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   call_audio_mute_mic_async (want_mute, on_libcallaudio_async_finished, NULL);
+ G_GNUC_END_IGNORE_DEPRECATIONS
+@@ -146,6 +166,7 @@
+   gboolean want_speaker;
+ 
+   want_speaker = gtk_toggle_button_get_active (togglebutton);
++  m52xq_toggle_style (togglebutton, NULL, NULL);
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   call_audio_enable_speaker_async (want_speaker, on_libcallaudio_async_finished, NULL);
+ G_GNUC_END_IGNORE_DEPRECATIONS
+@@ -543,6 +564,9 @@
+ cui_call_display_init (CuiCallDisplay *self)
+ {
+   gtk_widget_init_template (GTK_WIDGET (self));
++  /* m52xq: initial look of the toggles */
++  m52xq_toggle_style (self->mute, M52XQ_MUTE_ICONS);
++  m52xq_toggle_style (self->speaker, NULL, NULL);
+ 
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   if (!call_audio_is_inited ()) {

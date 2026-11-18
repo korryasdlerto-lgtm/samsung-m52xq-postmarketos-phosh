@@ -1,0 +1,6 @@
+[Unit]
+Description=M52XQ: after a dark wake-up turned into a real one, give back Bluetooth, the modem network modes and the GPS (m52xq-wake-restore)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/m52xq-wake-restore

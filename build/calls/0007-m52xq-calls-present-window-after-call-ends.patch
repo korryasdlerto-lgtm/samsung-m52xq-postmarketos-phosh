@@ -1,0 +1,11 @@
+--- a/src/calls-call-window.c
++++ b/src/calls-call-window.c
+@@ -302,6 +302,8 @@
+     g_autoptr (CallsCallSelectorItem) first = g_list_model_get_item (G_LIST_MODEL (self->calls), 0);
+ 
+     set_focus (self, calls_call_selector_item_get_display (first));
++    /* m52xq: after "Add call" the main window (dial pad) is in front: bring the call window back */
++    gtk_window_present (GTK_WINDOW (self));
+   }
+ 
+   update_visibility (self);

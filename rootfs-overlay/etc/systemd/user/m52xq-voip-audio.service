@@ -1,0 +1,11 @@
+[Unit]
+Description=M52XQ: Telegram / VoIP call audio route (earpiece while a call is answered, loud speaker for the ring)
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/local/bin/m52xq-voip-audio
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

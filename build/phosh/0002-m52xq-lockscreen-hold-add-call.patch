@@ -1,0 +1,302 @@
+diff -ruN a/src/call.c b/src/call.c
+--- a/src/call.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/call.c	2026-11-12 15:10:10.948290578 +0200
+@@ -457,9 +457,49 @@
+ }
+ 
+ 
++/* m52xq: hold / resume through the Calls D-Bus API (Hold, CanHold) */
++static gboolean
++phosh_call_get_can_hold (CuiCall *call)
++{
++  PhoshCall *self;
++
++  g_return_val_if_fail (PHOSH_IS_CALL (call), FALSE);
++  self = PHOSH_CALL (call);
++
++  return phosh_dbus_calls_call_get_can_hold (self->proxy);
++}
++
++
++static void
++on_call_hold_finish (GObject *source_object, GAsyncResult *res, gpointer unused)
++{
++  PhoshDBusCallsCall *proxy = PHOSH_DBUS_CALLS_CALL (source_object);
++  g_autoptr (GError) err = NULL;
++
++  g_return_if_fail (PHOSH_DBUS_IS_CALLS_CALL_PROXY (proxy));
++
++  if (!phosh_dbus_calls_call_call_hold_finish (proxy, res, &err))
++    phosh_async_error_warn (err, "Failed to hold/resume call %p", proxy);
++}
++
++
++static void
++phosh_call_hold (CuiCall *call, gboolean hold)
++{
++  PhoshCall *self;
++
++  g_return_if_fail (PHOSH_IS_CALL (call));
++  self = PHOSH_CALL (call);
++
++  phosh_dbus_calls_call_call_hold (self->proxy, hold, self->cancel, on_call_hold_finish, NULL);
++}
++
++
+ static void
+ phosh_call_cui_call_interface_init (CuiCallInterface *iface)
+ {
++  iface->get_can_hold = phosh_call_get_can_hold;
++  iface->hold = phosh_call_hold;
+   iface->get_avatar_icon = phosh_call_get_avatar_icon;
+   iface->get_id = phosh_call_get_id;
+   iface->get_display_name = phosh_call_get_display_name;
+diff -ruN a/src/dbus/org.gnome.Calls.Call.xml b/src/dbus/org.gnome.Calls.Call.xml
+--- a/src/dbus/org.gnome.Calls.Call.xml	2026-10-04 15:01:58.000000000 +0300
++++ b/src/dbus/org.gnome.Calls.Call.xml	2026-11-12 15:10:10.948290578 +0200
+@@ -24,6 +24,9 @@
+   <interface name="org.gnome.Calls.Call">
+     <method name="Accept"/>
+     <method name="Hangup"/>
++    <method name="Hold">
++      <arg name="hold" type="b" direction="in"/>
++    </method>
+     <method name="SendDtmf">
+       <arg name="Tone" type="s" direction="in">
+         <doc:doc>
+@@ -76,5 +79,6 @@
+         </doc:description>
+       </doc:doc>
+     </property>
++    <property name="CanHold" type="b" access="read"/>
+   </interface>
+ </node>
+diff -ruN a/src/lockscreen.c b/src/lockscreen.c
+--- a/src/lockscreen.c	2026-10-04 15:01:58.000000000 +0300
++++ b/src/lockscreen.c	2026-11-12 15:11:03.595785034 +0200
+@@ -626,6 +626,26 @@
+ }
+ 
+ 
++/* m52xq: Add call on the call screen of the lock screen: hold the call, open the dial pad of Calls and ask to unlock */
++static void
++on_m52xq_add_call (PhoshLockscreen *self)
++{
++  PhoshLockscreenPrivate *priv = phosh_lockscreen_get_instance_private (self);
++  CuiCall *call = cui_call_display_get_call (priv->call_display);
++
++  if (call && cui_call_get_state (call) == CUI_CALL_STATE_ACTIVE)
++    cui_call_hold (call, TRUE);
++
++  g_dbus_connection_call (g_bus_get_sync (G_BUS_TYPE_SESSION, NULL, NULL),
++                          "org.gnome.Calls", "/org/gnome/Calls",
++                          "org.freedesktop.Application", "ActivateAction",
++                          g_variant_new_parsed ("('show-dial-pad', @av [], @a{sv} {})"),
++                          NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
++
++  show_unlock_page (self);
++}
++
++
+ static void
+ on_calls_call_added (PhoshLockscreen *self, const char *path)
+ {
+@@ -1201,6 +1221,8 @@
+ 
+   gtk_widget_init_template (GTK_WIDGET (self));
+ 
++  g_signal_connect_swapped (priv->call_display, "add-call", G_CALLBACK (on_m52xq_add_call), self);
++
+   /* LTR doesn't work for the deck
+    * https://gitlab.gnome.org/World/Phosh/phosh/-/issues/1132 */
+   gtk_widget_set_direction (GTK_WIDGET (priv->deck), GTK_TEXT_DIR_LTR);
+diff -ruN a/subprojects/libcall-ui/src/cui-call.c b/subprojects/libcall-ui/src/cui-call.c
+--- a/subprojects/libcall-ui/src/cui-call.c	2025-11-08 22:30:48.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call.c	2026-11-12 15:10:01.576385721 +0200
+@@ -234,6 +234,47 @@
+ }
+ 
+ /**
++ * cui_call_get_can_hold:
++ * @self: The call
++ *
++ * Returns: whether the call can be put on hold and resumed (m52xq)
++ */
++gboolean
++cui_call_get_can_hold (CuiCall *self)
++{
++  CuiCallInterface *iface;
++
++  g_return_val_if_fail (CUI_IS_CALL (self), FALSE);
++
++  iface = CUI_CALL_GET_IFACE (self);
++  if (!iface->get_can_hold || !iface->hold)
++    return FALSE;
++
++  return iface->get_can_hold (self);
++}
++
++/**
++ * cui_call_hold:
++ * @self: The call
++ * @hold: %TRUE to put the call on hold, %FALSE to resume it
++ *
++ * m52xq: put an active call on hold or resume a held one.
++ */
++void
++cui_call_hold (CuiCall *self, gboolean hold)
++{
++  CuiCallInterface *iface;
++
++  g_return_if_fail (CUI_IS_CALL (self));
++
++  iface = CUI_CALL_GET_IFACE (self);
++  if (!iface->hold)
++    return;
++
++  iface->hold (self, hold);
++}
++
++/**
+  * cui_call_accept:
+  * @self: The call
+  *
+diff -ruN a/subprojects/libcall-ui/src/cui-call-display.c b/subprojects/libcall-ui/src/cui-call-display.c
+--- a/subprojects/libcall-ui/src/cui-call-display.c	2026-11-12 15:08:57.365083023 +0200
++++ b/subprojects/libcall-ui/src/cui-call-display.c	2026-11-12 15:10:47.559933976 +0200
+@@ -42,6 +42,9 @@
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+ 
++/* m52xq: "add-call" is emitted by the Add call button */
++static guint m52xq_signals[1];
++
+ struct _CuiCallDisplay {
+   GtkOverlay              parent_instance;
+ 
+@@ -57,6 +60,8 @@
+   GtkBox                 *general_controls;
+   GtkToggleButton        *speaker;
+   GtkToggleButton        *mute;
++  GtkToggleButton        *hold;      /* m52xq */
++  GtkButton              *add_call;  /* m52xq */
+   GtkButton              *hang_up;
+   GtkButton              *answer;
+   CuiEncryptionIndicator *encryption_indicator;
+@@ -119,10 +124,19 @@
+ }
+ 
+ 
++static void m52xq_toggle_style (GtkToggleButton *button, const char *icon_on, const char *icon_off);
++
++/* m52xq: Hold puts the call on hold / resumes it (through the CuiCall implementation: Calls D-Bus Hold) */
+ static void
+ hold_toggled_cb (GtkToggleButton *togglebutton,
+                  CuiCallDisplay  *self)
+ {
++  m52xq_toggle_style (togglebutton, NULL, NULL);
++
++  if (!self->call)
++    return;
++
++  cui_call_hold (self->call, gtk_toggle_button_get_active (togglebutton));
+ }
+ 
+ 
+@@ -145,6 +159,22 @@
+ 
+ #define M52XQ_MUTE_ICONS "microphone-sensitivity-muted-symbolic", "audio-input-microphone-symbolic"
+ 
++/* m52xq: the Hold toggle follows the state of the call; Hold and Add call work for active / held calls that can be held */
++static void
++m52xq_sync_hold (CuiCallDisplay *self, CuiCallState state)
++{
++  gboolean can_hold = self->call && cui_call_get_can_hold (self->call);
++  gboolean holdable = can_hold && (state == CUI_CALL_STATE_ACTIVE || state == CUI_CALL_STATE_HELD);
++
++  gtk_widget_set_sensitive (GTK_WIDGET (self->hold), holdable);
++  gtk_widget_set_sensitive (GTK_WIDGET (self->add_call), holdable);
++
++  g_signal_handlers_block_by_func (self->hold, hold_toggled_cb, self);
++  gtk_toggle_button_set_active (self->hold, state == CUI_CALL_STATE_HELD);
++  m52xq_toggle_style (self->hold, NULL, NULL);
++  g_signal_handlers_unblock_by_func (self->hold, hold_toggled_cb, self);
++}
++
+ static void
+ mute_toggled_cb (GtkToggleButton *togglebutton,
+                  CuiCallDisplay  *self)
+@@ -177,6 +207,8 @@
+ add_call_clicked_cb (GtkButton      *button,
+                      CuiCallDisplay *self)
+ {
++  /* m52xq: the shell puts the call on hold, shows the unlock page and opens the dial pad of Calls */
++  g_signal_emit (self, m52xq_signals[0], 0);
+ }
+ 
+ 
+@@ -255,6 +287,8 @@
+       (GTK_WIDGET (self->gsm_controls),
+       state != CUI_CALL_STATE_CALLING);
+ 
++    m52xq_sync_hold (self, state);
++
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+     /* TODO Only switch to "call" audio mode for cellular calls */
+     call_audio_select_mode_async (CALL_AUDIO_MODE_CALL,
+@@ -517,6 +551,14 @@
+   object_class->dispose = cui_call_display_dispose;
+ 
+   /**
++   * CuiCallDisplay::add-call:
++   *
++   * The Add call button was pressed (m52xq).
++   */
++  m52xq_signals[0] = g_signal_new ("add-call", G_TYPE_FROM_CLASS (klass), G_SIGNAL_RUN_LAST,
++                                   0, NULL, NULL, NULL, G_TYPE_NONE, 0);
++
++  /**
+    * CuiCallDisplay:call:
+    *
+    * An opaque handle to a call
+@@ -540,6 +582,8 @@
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, general_controls);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, gsm_controls);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, hang_up);
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, hold);
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, add_call);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, keypad_entry);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, mute);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, primary_contact_info);
+@@ -567,6 +611,7 @@
+   /* m52xq: initial look of the toggles */
+   m52xq_toggle_style (self->mute, M52XQ_MUTE_ICONS);
+   m52xq_toggle_style (self->speaker, NULL, NULL);
++  m52xq_toggle_style (self->hold, NULL, NULL);
+ 
+ G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+   if (!call_audio_is_inited ()) {
+diff -ruN a/subprojects/libcall-ui/src/cui-call.h b/subprojects/libcall-ui/src/cui-call.h
+--- a/subprojects/libcall-ui/src/cui-call.h	2025-11-08 22:30:48.000000000 +0200
++++ b/subprojects/libcall-ui/src/cui-call.h	2026-11-12 15:09:52.520479199 +0200
+@@ -61,6 +61,10 @@
+   void           (*accept)                 (CuiCall *self);
+   void           (*hang_up)                (CuiCall *self);
+   void           (*send_dtmf)              (CuiCall *self, const gchar *dtmf);
++
++  /* m52xq: hold / resume of cellular calls (both optional) */
++  gboolean       (*get_can_hold)           (CuiCall *self);
++  void           (*hold)                   (CuiCall *self, gboolean hold);
+ };
+ 
+ GLoadableIcon *cui_call_get_avatar_icon (CuiCall *self);
+@@ -71,6 +75,9 @@
+ gboolean     cui_call_get_can_dtmf     (CuiCall *self);
+ gdouble      cui_call_get_active_time  (CuiCall *self);
+ 
++gboolean     cui_call_get_can_hold     (CuiCall *self);
++void         cui_call_hold             (CuiCall *self, gboolean hold);
++
+ void         cui_call_accept           (CuiCall *self);
+ void         cui_call_hang_up          (CuiCall *self);
+ void         cui_call_send_dtmf (CuiCall *self, const gchar *dtmf);

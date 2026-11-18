@@ -1,0 +1,2 @@
+# m52xq: the wake-up time of the RTC for the alarms of gnome-clocks is written by m52xq-idle-suspend (user session, group video)
+ACTION=="add", SUBSYSTEM=="rtc", KERNEL=="rtc0", RUN+="/bin/chgrp video /sys%p/wakealarm", RUN+="/bin/chmod 0664 /sys%p/wakealarm"

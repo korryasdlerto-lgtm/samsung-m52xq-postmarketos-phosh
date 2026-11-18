@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Speakerphone
+Name[ru]=Громкая связь
+Comment=Switch the sound between the loud speaker and the earpiece (Telegram calls)
+Comment[ru]=Переключить звук: громкий динамик / разговорный динамик (звонки Telegram)
+Icon=audio-speakers-symbolic
+Exec=/usr/local/bin/m52xq-speakerphone
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=speaker;earpiece;telegram;call;
+X-Purism-FormFactor=Workstation;Mobile;

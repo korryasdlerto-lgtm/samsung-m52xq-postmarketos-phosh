@@ -1,0 +1,5 @@
+# m52xq (2026-11-17): streams follow the default sink (Bluetooth headphones when connected, speaker otherwise).
+# module-stream-restore remembered the speaker for Firefox after Bluetooth was switched off and on: YouTube stayed
+# on the speaker while the system sounds went to the headphones. Volumes are still restored, devices are not.
+unload-module module-stream-restore
+load-module module-stream-restore restore_device=false

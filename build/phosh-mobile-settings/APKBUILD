@@ -1,0 +1,108 @@
+# Contributor: Newbyte <newbie13xd@gmail.com>
+maintainer="team/phosh <newbie13xd@gmail.com>"
+pkgname=phosh-mobile-settings
+_pkgver=0.58.0
+# m52xq: 9999 prefix like our phosh, so edge (0.59.0) does not replace it
+pkgver=9999$_pkgver
+pkgrel=100
+options="!check"
+_gccver=50.4
+pkgdesc="Settings app for mobile specific things"
+url="https://gitlab.gnome.org/World/Phosh/phosh-mobile-settings"
+# riscv64: stevia
+arch="all !armhf !riscv64"
+license="GPL-3.0-or-later"
+depends="
+	phoc-schemas
+	phosh-schemas
+	stevia-schemas
+	"
+_gccdeps="
+	blueprint-compiler
+	colord-dev
+	colord-gtk-dev
+	gcr4-dev
+	gnome-bluetooth-dev
+	gnome-online-accounts-dev
+	gnome-settings-daemon-dev
+	krb5-dev
+	libgtop-dev
+	libnma-dev
+	libpwquality-dev
+	libsecret-dev
+	py3-polib
+	samba-dev
+	tecla-dev
+	udisks2-dev
+	"
+makedepends="
+	$_gccdeps
+	accountsservice-dev
+	cellbroadcastd-dev
+	desktop-file-utils
+	feedbackd-dev
+	glib-dev
+	gmobile-dev
+	gnome-desktop-dev
+	gsound-dev
+	gtk4.0-dev
+	json-glib-dev
+	libadwaita-dev
+	libportal-dev
+	lm-sensors-dev
+	meson
+	networkmanager-dev
+	phosh-dev
+	pulseaudio-dev
+	yaml-dev
+	"
+checkdepends="xvfb-run gsettings-desktop-schemas phosh"
+subpackages="
+	$pkgname-dbg
+	$pkgname-dev
+	$pkgname-lang
+	$pkgname-libs
+	"
+source="https://sources.phosh.mobi/releases/phosh-mobile-settings/phosh-mobile-settings-$_pkgver.tar.xz
+	https://download.gnome.org/sources/gnome-control-center/${_gccver%%.*}/gnome-control-center-$_gccver.tar.xz
+	libpms-dep-enum-sources.patch
+	s390x.patch
+	0001-m52xq-keep-switch-of-bluetooth-wifi-panels.patch
+	"
+builddir="$srcdir/$pkgname-$_pkgver"
+
+prepare() {
+	default_prepare
+	mv "$srcdir"/gnome-control-center-$_gccver subprojects/g-c-c
+
+	for i in subprojects/packagefiles/g-c-c/*.patch; do
+		patch -p1 -d subprojects/g-c-c < "$i"
+	done
+}
+
+build() {
+	abuild-meson \
+		-Db_lto=true \
+		-Dtweaks-data-dir=/usr/share/postmarketos-tweaks \
+		-Dpolkit-group=wheel \
+		-Dgcc-panels=true \
+		-Dgcc-po=true \
+		. output
+	meson compile -C output
+}
+
+check() {
+	xvfb-run meson test --print-errorlogs --suite unit -C output
+}
+
+package() {
+	DESTDIR="$pkgdir" meson install --no-rebuild --skip-subprojects -C output
+}
+
+sha512sums="
+50b7803437b76528a44b5ddceab290a9d5df87c7af810d5aedcb3d27110c41a3befcb48c67e0f8029b53ffe6ca600cc057e41b51390a6dbadf972a716200dc4a  phosh-mobile-settings-0.58.0.tar.xz
+60e4bc9e6b31edf2765f786bcbd49bed683f21960f48eeb6bb87c44602fb7ae32d85b7d930e8cdcfcd8d0eb5a9c5a1d0c08e0a8ddd213f8c5a4c8d29c3359c95  gnome-control-center-50.4.tar.xz
+aaaea7400beb6ea3a1589f17a89eb27e807731f3e5de1c8e1b0a499f04e9397d3a01f555986f28564387e1bb1426d76e85b4766e72399ccbc1e59f37bd33e9ca  libpms-dep-enum-sources.patch
+df113d6548993ba92a562dd9d70c2a0141673731e3ea4b08142ac3a5161d27c70956a0577faee5a2d5d341f1115e02121eaa3d84e38826b4f197ebc477f364e9  s390x.patch
+4fd28871a66b935ab98223a8c5ff2f6dd89e56a6b32889629aeb5ac83dbe6e163627784b1c6e916f2da21bf846789fa29ac7970f6693e9939811a0b59138db8d  0001-m52xq-keep-switch-of-bluetooth-wifi-panels.patch
+"

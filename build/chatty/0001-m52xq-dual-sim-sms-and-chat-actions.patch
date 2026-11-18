@@ -1,0 +1,299 @@
+diff --git a/src/chatty-message-bar.c b/src/chatty-message-bar.c
+index 4d4c454..20bf3fc 100644
+--- a/src/chatty-message-bar.c
++++ b/src/chatty-message-bar.c
+@@ -34,6 +34,7 @@
+ #include "chatty-ma-chat.h"
+ #include "chatty-message.h"
+ #include "chatty-mm-chat.h"
++#include "chatty-mm-account.h"
+ #include "chatty-purple.h"
+ #include "chatty-settings.h"
+ 
+@@ -48,6 +49,7 @@ struct _ChattyMessageBar
+   GtkWidget     *scrolled_window;
+   GtkWidget     *message_input;
+   GtkWidget     *send_message_button;
++  GtkWidget     *m52xq_sim_button;   /* m52xq dual SIM: "SIM 1" / "SIM 2" of this chat */
+   GtkSourceBuffer *message_buffer;
+ 
+   ChattyHistory *history;
+@@ -630,6 +632,8 @@ attachment_files_changed_cb (ChattyMessageBar *self)
+   gtk_revealer_set_reveal_child (GTK_REVEALER (self->attachment_revealer), n_items);
+ }
+ 
++static void m52xq_sim_button_clicked_cb (ChattyMessageBar *self);
++
+ static void
+ chatty_message_bar_init (ChattyMessageBar *self)
+ {
+@@ -643,6 +647,17 @@ chatty_message_bar_init (ChattyMessageBar *self)
+ 
+   gtk_widget_init_template (GTK_WIDGET (self));
+ 
++  /* m52xq dual SIM: SIM button left of the attachment button */
++  self->m52xq_sim_button = gtk_button_new_with_label ("SIM 1");
++  gtk_widget_set_valign (self->m52xq_sim_button, GTK_ALIGN_END);
++  gtk_widget_set_margin_end (self->m52xq_sim_button, 6);
++  gtk_widget_set_tooltip_text (self->m52xq_sim_button, "SIM card used to send messages in this chat");
++  gtk_widget_set_visible (self->m52xq_sim_button, FALSE);
++  gtk_widget_insert_before (self->m52xq_sim_button, gtk_widget_get_parent (self->send_file_button),
++                            self->send_file_button);
++  g_signal_connect_swapped (self->m52xq_sim_button, "clicked",
++                            G_CALLBACK (m52xq_sim_button_clicked_cb), self);
++
+   files = chatty_attachments_bar_get_files_list (CHATTY_ATTACHMENTS_BAR (self->attachment_bar));
+   g_signal_connect_object (files, "items-changed",
+                            G_CALLBACK (attachment_files_changed_cb),
+@@ -683,6 +698,40 @@ chat_get_draft_cb (GObject      *object,
+   self->draft_is_loading = FALSE;
+ }
+ 
++/* m52xq dual SIM: show the SIM the chat sends on; only for SMS chats with two SIM modems */
++static void
++m52xq_sim_button_update (ChattyMessageBar *self)
++{
++  ChattyAccount *account = self->chat ? chatty_chat_get_account (self->chat) : NULL;
++  g_autofree char *label = NULL;
++  guint slot;
++
++  if (!CHATTY_IS_MM_CHAT (self->chat) || !CHATTY_IS_MM_ACCOUNT (account) ||
++      chatty_mm_account_get_n_sims (CHATTY_MM_ACCOUNT (account)) < 2) {
++    gtk_widget_set_visible (self->m52xq_sim_button, FALSE);
++    return;
++  }
++
++  slot = chatty_mm_account_get_chat_sim (CHATTY_MM_ACCOUNT (account), self->chat);
++  label = g_strdup_printf ("SIM %u", slot ? slot : 1);
++  gtk_button_set_label (GTK_BUTTON (self->m52xq_sim_button), label);
++  gtk_widget_set_visible (self->m52xq_sim_button, TRUE);
++}
++
++static void
++m52xq_sim_button_clicked_cb (ChattyMessageBar *self)
++{
++  ChattyAccount *account = self->chat ? chatty_chat_get_account (self->chat) : NULL;
++  guint slot;
++
++  if (!CHATTY_IS_MM_ACCOUNT (account))
++    return;
++
++  slot = chatty_mm_account_get_chat_sim (CHATTY_MM_ACCOUNT (account), self->chat);
++  chatty_mm_account_set_chat_sim (CHATTY_MM_ACCOUNT (account), self->chat, slot == 2 ? 1 : 2);
++  m52xq_sim_button_update (self);
++}
++
+ void
+ chatty_message_bar_set_chat (ChattyMessageBar *self,
+                              ChattyChat       *chat)
+@@ -748,6 +797,7 @@ chatty_message_bar_set_chat (ChattyMessageBar *self,
+                            self, G_CONNECT_SWAPPED);
+   chatty_message_account_status_changed_cb (self);
+   chatty_message_chat_encrypt_changed_cb (self);
++  m52xq_sim_button_update (self);
+ 
+   gtk_widget_grab_focus (self->message_input);
+ }
+diff --git a/src/chatty-window.c b/src/chatty-window.c
+index d1b2978..c3aeb52 100644
+--- a/src/chatty-window.c
++++ b/src/chatty-window.c
+@@ -179,6 +179,9 @@ window_chat_list_selection_changed (ChattyWindow   *self,
+   g_return_if_fail (CHATTY_IS_CHAT (chat));
+ 
+   if (chat == (gpointer)chatty_main_view_get_item (CHATTY_MAIN_VIEW (self->main_view))) {
++    /* m52xq: the actions were turned off above; the chat stays open (e.g. the list re-sorted after
++     * sending a message), so turn them on again (call, details, block, archive, delete were greyed) */
++    chatty_window_enable_per_chat_actions (self, TRUE);
+     adw_navigation_split_view_set_show_content (ADW_NAVIGATION_SPLIT_VIEW (self->split_view), TRUE);
+ 
+     if (chatty_window_get_active_chat (self)) {
+diff --git a/src/mm/chatty-mm-account.c b/src/mm/chatty-mm-account.c
+index 2552afe..4b5e215 100644
+--- a/src/mm/chatty-mm-account.c
++++ b/src/mm/chatty-mm-account.c
+@@ -47,6 +47,66 @@ struct _ChattyMmDevice
+ 
+ G_DEFINE_TYPE (ChattyMmDevice, chatty_mm_device, G_TYPE_OBJECT)
+ 
++/*
++ * m52xq dual SIM: with both SIMs active ModemManager has one modem object per SIM, model "SIM 1" / "SIM 2"
++ * (our ModemManager build). Chatty sent every SMS through the first modem; now each chat has a SIM:
++ * the one chosen in the chat (button next to the attachment button) or else the SIM on which the last
++ * message of that number came in. Kept in ~/.local/share/chatty/m52xq-chat-sim.ini.
++ */
++static guint
++m52xq_device_slot (ChattyMmDevice *device)
++{
++  const char *model;
++
++  if (!device || !device->mm_object || !mm_object_peek_modem (device->mm_object))
++    return 0;
++  model = mm_modem_get_model (mm_object_peek_modem (device->mm_object));
++  if (g_strcmp0 (model, "SIM 1") == 0)
++    return 1;
++  if (g_strcmp0 (model, "SIM 2") == 0)
++    return 2;
++  return 0;
++}
++
++static char *
++m52xq_sim_store_path (void)
++{
++  return g_build_filename (g_get_user_data_dir (), "chatty", "m52xq-chat-sim.ini", NULL);
++}
++
++static guint
++m52xq_sim_store_get (const char *number, const char *suffix)
++{
++  g_autoptr(GKeyFile) kf = g_key_file_new ();
++  g_autofree char *path = m52xq_sim_store_path ();
++  g_autofree char *key = NULL;
++
++  if (!number || !*number || !g_key_file_load_from_file (kf, path, G_KEY_FILE_NONE, NULL))
++    return 0;
++  key = g_strconcat (number, suffix, NULL);
++  return (guint) g_key_file_get_integer (kf, "chats", key, NULL);
++}
++
++static void
++m52xq_sim_store_set (const char *number, const char *suffix, guint slot)
++{
++  g_autoptr(GKeyFile) kf = g_key_file_new ();
++  g_autofree char *path = m52xq_sim_store_path ();
++  g_autofree char *dir = g_path_get_dirname (path);
++  g_autofree char *key = NULL;
++
++  if (!number || !*number)
++    return;
++  g_key_file_load_from_file (kf, path, G_KEY_FILE_KEEP_COMMENTS, NULL);
++  key = g_strconcat (number, suffix, NULL);
++  if ((guint) g_key_file_get_integer (kf, "chats", key, NULL) == slot)
++    return;
++  g_key_file_set_integer (kf, "chats", key, slot);
++  g_mkdir_with_parents (dir, 0700);
++  if (!g_key_file_save_to_file (kf, path, NULL))
++    g_warning ("m52xq: could not save %s", path);
++}
++
+ static void
+ chatty_mm_device_finalize (GObject *object)
+ {
+@@ -616,6 +676,11 @@ mm_account_add_sms (ChattyMmAccount *self,
+                     MMSmsState       state)
+ {
+   g_autoptr(ChattyMessage) message = NULL;
++
++  /* m52xq dual SIM: replies go out on the SIM the last message came in on (unless chosen in the chat) */
++  if (state == MM_SMS_STATE_RECEIVED && m52xq_device_slot (device))
++    m52xq_sim_store_set (mm_sms_get_number (sms), ".last", m52xq_device_slot (device));
++
+   g_autoptr(GDateTime) date_time = NULL;
+   g_autoptr(ChattyMmBuddy) senderbuddy = NULL;
+   ChattyChat *chat;
+@@ -1647,7 +1712,24 @@ chatty_mm_account_send_message_async (ChattyMmAccount     *self,
+   g_object_set_data_full (G_OBJECT (task), "chat", g_object_ref (chat),
+                           g_object_unref);
+ 
+-  device = g_list_model_get_item (G_LIST_MODEL (self->device_list), 0);
++  device = NULL;
++  {
++    /* m52xq dual SIM: the modem of the SIM of this chat, else the first modem (upstream) */
++    guint slot = chatty_mm_account_get_chat_sim (self, chat);
++
++    for (guint i = 0; slot && i < g_list_model_get_n_items (G_LIST_MODEL (self->device_list)); i++) {
++      ChattyMmDevice *d = g_list_model_get_item (G_LIST_MODEL (self->device_list), i);
++
++      if (m52xq_device_slot (d) == slot) {
++        device = d;
++        break;
++      }
++      g_object_unref (d);
++    }
++    CHATTY_TRACE_MSG ("m52xq: chat SIM %u, matching modem: %d", slot, !!device);
++  }
++  if (!device)
++    device = g_list_model_get_item (G_LIST_MODEL (self->device_list), 0);
+   g_object_set_data_full (G_OBJECT (task), "device", device, g_object_unref);
+ 
+   if (!device) {
+@@ -1754,3 +1836,61 @@ chatty_mm_account_set_mms_settings_finish (ChattyMmAccount *self,
+ 
+   return chatty_mmsd_set_settings_finish (self->mmsd, result, error);
+ }
++
++
++/* m52xq dual SIM -------------------------------------------------------------------------------- */
++
++/**
++ * chatty_mm_account_get_n_sims:
++ *
++ * Returns: the number of modems with a SIM slot name ("SIM 1" / "SIM 2")
++ */
++guint
++chatty_mm_account_get_n_sims (ChattyMmAccount *self)
++{
++  guint n = 0;
++
++  g_return_val_if_fail (CHATTY_IS_MM_ACCOUNT (self), 0);
++
++  for (guint i = 0; i < g_list_model_get_n_items (G_LIST_MODEL (self->device_list)); i++) {
++    g_autoptr(ChattyMmDevice) d = g_list_model_get_item (G_LIST_MODEL (self->device_list), i);
++
++    if (m52xq_device_slot (d))
++      n++;
++  }
++  return n;
++}
++
++/**
++ * chatty_mm_account_get_chat_sim:
++ *
++ * Returns: the SIM (1 or 2) used to send in @chat: chosen in the chat, else the SIM of the last
++ *   incoming message of that number, else 0 (first modem)
++ */
++guint
++chatty_mm_account_get_chat_sim (ChattyMmAccount *self,
++                                ChattyChat      *chat)
++{
++  const char *name;
++  guint slot;
++
++  g_return_val_if_fail (CHATTY_IS_MM_ACCOUNT (self), 0);
++  if (!chat)
++    return 0;
++
++  name = chatty_chat_get_chat_name (chat);
++  slot = m52xq_sim_store_get (name, "");
++  if (!slot)
++    slot = m52xq_sim_store_get (name, ".last");
++  return slot <= 2 ? slot : 0;
++}
++
++void
++chatty_mm_account_set_chat_sim (ChattyMmAccount *self,
++                                ChattyChat      *chat,
++                                guint            slot)
++{
++  g_return_if_fail (CHATTY_IS_MM_ACCOUNT (self));
++  if (chat && slot <= 2)
++    m52xq_sim_store_set (chatty_chat_get_chat_name (chat), "", slot);
++}
+diff --git a/src/mm/chatty-mm-account.h b/src/mm/chatty-mm-account.h
+index 0ad6f55..85880c9 100644
+--- a/src/mm/chatty-mm-account.h
++++ b/src/mm/chatty-mm-account.h
+@@ -48,6 +48,13 @@ ChattyChat      *chatty_mm_account_start_chat_with_uri (ChattyMmAccount     *sel
+ void             chatty_mm_account_delete_chat         (ChattyMmAccount     *self,
+                                                         ChattyChat          *chat);
+ gboolean         chatty_mm_account_has_mms_feature     (ChattyMmAccount     *self);
++/* m52xq dual SIM */
++guint            chatty_mm_account_get_n_sims          (ChattyMmAccount     *self);
++guint            chatty_mm_account_get_chat_sim        (ChattyMmAccount     *self,
++                                                        ChattyChat          *chat);
++void             chatty_mm_account_set_chat_sim        (ChattyMmAccount     *self,
++                                                        ChattyChat          *chat,
++                                                        guint                slot);
+ void             chatty_mm_account_send_message_async  (ChattyMmAccount     *self,
+                                                         ChattyChat          *chat,
+                                                         ChattyMmBuddy       *buddy,

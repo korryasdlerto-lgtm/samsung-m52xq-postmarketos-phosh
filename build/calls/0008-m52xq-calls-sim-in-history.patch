@@ -1,0 +1,130 @@
+--- a/src/calls-call-record.c
++++ b/src/calls-call-record.c
+@@ -36,6 +36,7 @@
+   GDateTime  *answered;
+   GDateTime  *end;
+   char       *protocol;
++  char       *sim;      /* m52xq: name of the SIM (origin) the call went through */
+   gboolean    complete;
+ };
+ 
+@@ -51,6 +52,7 @@
+   PROP_ANSWERED,
+   PROP_END,
+   PROP_PROTOCOL,
++  PROP_SIM,
+   PROP_LAST_PROP,
+ };
+ static GParamSpec *props[PROP_LAST_PROP];
+@@ -100,6 +102,10 @@
+     g_value_set_string (value, self->protocol);
+     break;
+ 
++  case PROP_SIM:
++    g_value_set_string (value, self->sim);
++    break;
++
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -159,6 +165,11 @@
+     self->protocol = g_value_dup_string (value);
+     break;
+ 
++  case PROP_SIM:
++    g_free (self->sim);
++    self->sim = g_value_dup_string (value);
++    break;
++
+   default:
+     G_OBJECT_WARN_INVALID_PROPERTY_ID (object, property_id, pspec);
+     break;
+@@ -176,6 +187,7 @@
+   g_clear_pointer (&self->start, g_date_time_unref);
+   g_free (self->target);
+   g_free (self->protocol);
++  g_free (self->sim);
+ 
+   G_OBJECT_CLASS (calls_call_record_parent_class)->finalize (object);
+ }
+@@ -277,6 +289,16 @@
+ 
+   gom_resource_class_set_property_new_in_version (resource_class, "protocol", 2);
+ 
++  props[PROP_SIM] =
++    g_param_spec_string ("sim",
++                         "SIM",
++                         "The SIM (origin) the call was made with",
++                         NULL,
++                         G_PARAM_READWRITE | G_PARAM_CONSTRUCT);
++  g_object_class_install_property (object_class, PROP_SIM, props[PROP_SIM]);
++
++  gom_resource_class_set_property_new_in_version (resource_class, "sim", 3);
++
+ 
+   /*
+    * NB: ANY ADDITIONS TO THIS LIST REQUIRE AN INCREASE IN
+--- a/src/calls-record-store.c
++++ b/src/calls-record-store.c
+@@ -39,7 +39,7 @@
+ 
+ 
+ #define RECORD_STORE_FILENAME "records.db"
+-#define RECORD_STORE_VERSION  2
++#define RECORD_STORE_VERSION  3
+ 
+ enum {
+   SIGNAL_DB_DONE,
+@@ -476,19 +476,31 @@
+   struct CallsRecordCallData *data;
+   gboolean inbound;
+   g_autofree char *protocol = NULL;
++  g_autofree char *sim = NULL;
++  g_autofree char *origin_id = NULL;
+ 
+   g_assert (g_object_get_data (call_obj, "calls-call-record") == NULL);
+ 
+   start = g_object_get_data (call_obj, "calls-call-start");
+   g_assert (start != NULL);
+ 
+-  g_object_get (call, "inbound", &inbound, "protocol", &protocol, NULL);
++  g_object_get (call, "inbound", &inbound, "protocol", &protocol, "origin-id", &origin_id, NULL);
++
++  /* m52xq: remember which SIM the call went through */
++  if (origin_id && *origin_id) {
++    g_autoptr (CallsOrigin) origin =
++      calls_manager_get_origin_by_id (calls_manager_get_default (), origin_id);
++
++    if (origin)
++      sim = calls_origin_get_name (origin);
++  }
+ 
+   record = g_object_new (CALLS_TYPE_CALL_RECORD,
+                          "repository", self->repository,
+                          "target", cui_call_get_id (CUI_CALL (call)),
+                          "inbound", inbound,
+                          "protocol", protocol,
++                         "sim", sim,
+                          "start", start,
+                          NULL);
+ 
+--- a/src/calls-call-record-row.c
++++ b/src/calls-call-record-row.c
+@@ -119,8 +119,17 @@
+                   gboolean           *final)
+ {
+   gchar *nice;
++  g_autofree char *sim = NULL;
+ 
+   nice_time (end, &nice, final);
++  /* m52xq: the SIM of the call under the time */
++  g_object_get (G_OBJECT (self->record), "sim", &sim, NULL);
++  if (sim && *sim) {
++    gchar *with_sim = g_strdup_printf ("%s\n%s", nice, sim);
++
++    g_free (nice);
++    nice = with_sim;
++  }
+   gtk_label_set_text (self->time, nice);
+   g_free (nice);
+ }

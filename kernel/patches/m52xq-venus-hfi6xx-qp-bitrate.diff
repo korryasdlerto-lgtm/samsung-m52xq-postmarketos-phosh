@@ -1,0 +1,140 @@
+diff --git a/drivers/media/platform/qcom/venus/hfi_cmds.c b/drivers/media/platform/qcom/venus/hfi_cmds.c
+index 3ae063094..8a4bf247b 100644
+--- a/drivers/media/platform/qcom/venus/hfi_cmds.c
++++ b/drivers/media/platform/qcom/venus/hfi_cmds.c
+@@ -1341,6 +1341,21 @@ pkt_session_set_property_6xx(struct hfi_session_set_property_pkt *pkt,
+ 		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*wr);
+ 		break;
+ 	}
++	case HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX: {
++		/* m52xq: frame QP for Iris2 (msm_vidc layout) */
++		struct hfi_frame_qp_6xx *in = pdata, *qp = prop_data;
++
++		*qp = *in;
++		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*qp);
++		break;
++	}
++	case HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX: {
++		struct hfi_enable *in = pdata, *en = prop_data;
++
++		en->enable = in->enable;
++		pkt->shdr.hdr.size += sizeof(u32) + sizeof(*en);
++		break;
++	}
+ 	default:
+ 		return pkt_session_set_property_4xx(pkt, cookie, ptype, pdata);
+ 	}
+diff --git a/drivers/media/platform/qcom/venus/hfi_helper.h b/drivers/media/platform/qcom/venus/hfi_helper.h
+index f44059f19..c65cf1dee 100644
+--- a/drivers/media/platform/qcom/venus/hfi_helper.h
++++ b/drivers/media/platform/qcom/venus/hfi_helper.h
+@@ -568,6 +568,25 @@ struct hfi_buffer_info {
+ 	u32 extradata_addr;
+ };
+ 
++/*
++ * m52xq: Iris2 (HFI 6xx, SM7325) encoder properties as the Qualcomm msm_vidc driver sends them:
++ * the frame QP is a CONFIG with packed I/P/B values and an enable mask, bitrates are set for all
++ * layers (layer id 0xff); PARAM_VENC_SESSION_QP is not packed for 6xx at all.
++ */
++#define HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX		0x2006012
++#define HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX	0x2005031
++#define HFI_6XX_ALL_LAYER_ID				0xff
++#define HFI_6XX_QP_ENABLE_I				0x1
++#define HFI_6XX_QP_ENABLE_P				0x2
++#define HFI_6XX_QP_ENABLE_B				0x4
++
++struct hfi_frame_qp_6xx {
++	u32 qp_packed;
++	u32 layer_id;
++	u32 enable;
++	u32 reserved[3];
++};
++
+ struct hfi_bitrate {
+ 	u32 bitrate;
+ 	u32 layer_id;
+diff --git a/drivers/media/platform/qcom/venus/venc.c b/drivers/media/platform/qcom/venus/venc.c
+index 13a4e4e9f..42a6c0bd3 100644
+--- a/drivers/media/platform/qcom/venus/venc.c
++++ b/drivers/media/platform/qcom/venus/venc.c
+@@ -878,9 +878,19 @@ static int venc_set_properties(struct venus_inst *inst)
+ 		if (rate_control != HFI_RATE_CONTROL_OFF)
+ 			bitrate = m52xq_venc_bitrate(inst, bitrate);
+ 
++		/* m52xq: Iris2 takes the bitrate for all layers (msm_vidc: BITRATE_TYPE 0, layer id 0xff) */
++		if (IS_V6(inst->core)) {
++			struct hfi_enable bt = { .enable = 0 };
++
++			ptype = HFI_PROPERTY_PARAM_VENC_BITRATE_TYPE_6XX;
++			ret = hfi_session_set_property(inst, ptype, &bt);
++			if (ret)
++				return ret;
++		}
++
+ 		ptype = HFI_PROPERTY_CONFIG_VENC_TARGET_BITRATE;
+ 		brate.bitrate = bitrate;
+-		brate.layer_id = 0;
++		brate.layer_id = IS_V6(inst->core) ? HFI_6XX_ALL_LAYER_ID : 0;
+ 
+ 		ret = hfi_session_set_property(inst, ptype, &brate);
+ 		if (ret)
+@@ -892,13 +902,16 @@ static int venc_set_properties(struct venus_inst *inst)
+ 		else
+ 			bitrate = ctr->bitrate_peak;
+ 
+-		ptype = HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE;
+-		brate.bitrate = bitrate;
+-		brate.layer_id = 0;
++		/* m52xq: msm_vidc does not send a max bitrate to Iris2 (no such config in its table) */
++		if (!IS_V6(inst->core)) {
++			ptype = HFI_PROPERTY_CONFIG_VENC_MAX_BITRATE;
++			brate.bitrate = bitrate;
++			brate.layer_id = 0;
+ 
+-		ret = hfi_session_set_property(inst, ptype, &brate);
+-		if (ret)
+-			return ret;
++			ret = hfi_session_set_property(inst, ptype, &brate);
++			if (ret)
++				return ret;
++		}
+ 	}
+ 
+ 	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_H264 ||
+@@ -914,6 +927,35 @@ static int venc_set_properties(struct venus_inst *inst)
+ 			return ret;
+ 	}
+ 
++	/*
++	 * m52xq: Iris2 (HFI 6xx) never got PARAM_VENC_SESSION_QP (the 4xx packer returns -ENOTSUPP, which is
++	 * ignored): send the frame QP as msm_vidc does - CONFIG_VENC_FRAME_QP with packed I/P/B and an enable
++	 * mask, for all layers. With rate control on only when the client set the QP away from the default.
++	 */
++	if (IS_V6(inst->core) && inst->fmt_cap->pixfmt != V4L2_PIX_FMT_VP8) {
++		struct hfi_frame_qp_6xx fqp = {};
++		u32 qi, qpp, qb;
++
++		if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
++			qi = ctr->hevc_i_qp;
++			qpp = ctr->hevc_p_qp;
++			qb = ctr->hevc_b_qp;
++		} else {
++			qi = ctr->h264_i_qp;
++			qpp = ctr->h264_p_qp;
++			qb = ctr->h264_b_qp;
++		}
++		fqp.qp_packed = qi | qpp << 8 | qb << 16;
++		fqp.layer_id = HFI_6XX_ALL_LAYER_ID;
++		fqp.enable = HFI_6XX_QP_ENABLE_I | HFI_6XX_QP_ENABLE_P | HFI_6XX_QP_ENABLE_B;
++		if (rate_control == HFI_RATE_CONTROL_OFF) {
++			ret = hfi_session_set_property(inst, HFI_PROPERTY_CONFIG_VENC_FRAME_QP_6XX, &fqp);
++			if (ret)
++				return ret;
++			dev_dbg(inst->core->dev, "m52xq: frame QP %u/%u/%u (rate control off)\n", qi, qpp, qb);
++		}
++	}
++
+ 	ptype = HFI_PROPERTY_PARAM_VENC_SESSION_QP;
+ 	if (inst->fmt_cap->pixfmt == V4L2_PIX_FMT_HEVC) {
+ 		quant.qp_i = ctr->hevc_i_qp;

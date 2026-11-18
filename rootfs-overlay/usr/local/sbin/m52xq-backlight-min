@@ -1,0 +1,16 @@
+#!/bin/sh
+# m52xq: systemd-backlight saves the brightness at shutdown; a reboot while the screen was dimmed (idle-dim) or blanked
+# saved a near-black value (9/255) and the phone booted with it. Before the restore: a saved value below 64/255 -> 128.
+min=64
+set_to=128
+for f in /var/lib/systemd/backlight/*backlight:ae94000.dsi.0; do
+    [ -f "$f" ] || continue
+    # the file has more than one line (systemd 262: "9\n6\n"); the brightness is the first line
+    v=$(head -n 1 "$f" 2>/dev/null)
+    case "$v" in ''|*[!0-9]*) continue ;; esac
+    if [ "$v" -lt "$min" ]; then
+        echo "m52xq-backlight-min: saved brightness $v < $min, restoring $set_to instead"
+        sed -i "1s/.*/$set_to/" "$f"
+    fi
+done
+exit 0

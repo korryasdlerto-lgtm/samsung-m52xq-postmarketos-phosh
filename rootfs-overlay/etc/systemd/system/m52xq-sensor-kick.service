@@ -1,0 +1,12 @@
+[Unit]
+Description=M52XQ: start iio-sensor-proxy early, restart it once the ADSP accelerometer is up
+After=hexagonrpcd-adsp-sensorspd.service
+Wants=hexagonrpcd-adsp-sensorspd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/m52xq-sensor-kick
+TimeoutStartSec=200
+
+[Install]
+WantedBy=multi-user.target

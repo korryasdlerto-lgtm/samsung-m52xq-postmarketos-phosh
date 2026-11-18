@@ -1,0 +1,235 @@
+diff -ruN a/subprojects/libcall-ui/src/cui-call-display.c b/subprojects/libcall-ui/src/cui-call-display.c
+--- a/subprojects/libcall-ui/src/cui-call-display.c	2026-11-17 00:26:28.724894149 +0200
++++ b/subprojects/libcall-ui/src/cui-call-display.c	2026-11-17 01:05:33.937949312 +0200
+@@ -80,10 +80,139 @@
+ 
+   gboolean                needs_cam_reset; /* cam = Call Audio Mode */
+   gboolean                update_status_time;
++
++  /* m52xq r104: landscape layout (the portrait column did not fit: no answer/hang-up buttons in landscape) */
++  GtkBox                 *main_box;
++  GtkBox                 *action_box;
++  gboolean                m52xq_landscape;
++  guint                   m52xq_avatar_size;
++  guint                   m52xq_layout_id;
++  GdkMonitor             *m52xq_monitor;    /* r106: the screen whose size decides the layout */
++  gulong                  m52xq_geometry_handler;
+ };
+ 
+ G_DEFINE_TYPE (CuiCallDisplay, cui_call_display, ADW_TYPE_BIN);
+ 
++/*
++ * m52xq r104: a phone in landscape gives the call display ~370 px of height; the portrait column (number, avatar up to
++ * 160 px, status, button grid, 72 px answer/hang-up row) needs ~600, the answer and hang-up buttons were off screen.
++ * Wide and lower than M52XQ_LANDSCAPE_MAX_H: the main box turns horizontal (info | buttons | answer/hang-up), the
++ * avatar is M52XQ_LANDSCAPE_AVATAR and the encryption line is hidden. The layout is changed in an idle (not during the
++ * allocation).
++ * r105: the size is the one of the WINDOW SURFACE (GdkSurface::layout, set by the compositor on rotation). r104 measured
++ * the display itself, but its size follows its own layout (horizontal min. width ~830 overflowed a portrait screen and
++ * still looked "landscape", vertical min. height ~600 in landscape looked "portrait"): after a turn there and back the
++ * wrong layout stuck.
++ * r106: the window surface is not independent either (GTK never makes it smaller than the content: after a horizontal
++ * layout the portrait window stayed wider than the screen, after a vertical one the landscape window taller): the
++ * MONITOR geometry decides (logical size, changes on rotation), and after a change the window is laid out again.
++ */
++#define M52XQ_LANDSCAPE_MAX_H 600
++#define M52XQ_LANDSCAPE_AVATAR 64
++
++static void
++m52xq_apply_avatar (CuiCallDisplay *self)
++{
++  guint size = self->m52xq_avatar_size ? self->m52xq_avatar_size : 80;
++
++  if (self->m52xq_landscape && size > M52XQ_LANDSCAPE_AVATAR)
++    size = M52XQ_LANDSCAPE_AVATAR;
++  adw_avatar_set_size (self->avatar, size);
++}
++
++static void
++m52xq_set_avatar_size (CuiCallDisplay *self, guint size)
++{
++  self->m52xq_avatar_size = size;
++  m52xq_apply_avatar (self);
++}
++
++static gboolean
++m52xq_apply_layout (gpointer data)
++{
++  CuiCallDisplay *self = CUI_CALL_DISPLAY (data);
++  gboolean land = self->m52xq_landscape;
++
++  self->m52xq_layout_id = 0;
++  gtk_orientable_set_orientation (GTK_ORIENTABLE (self->main_box),
++                                  land ? GTK_ORIENTATION_HORIZONTAL : GTK_ORIENTATION_VERTICAL);
++  gtk_box_set_spacing (self->main_box, land ? 48 : 24);
++  gtk_widget_set_valign (GTK_WIDGET (self->action_box), land ? GTK_ALIGN_CENTER : GTK_ALIGN_FILL);
++  gtk_widget_set_visible (GTK_WIDGET (self->encryption_indicator), !land);
++  m52xq_apply_avatar (self);
++  /* r106: let the window fit the screen again (it may have been widened/heightened by the previous layout) */
++  {
++    GtkRoot *root = gtk_widget_get_root (GTK_WIDGET (self));
++
++    if (root)
++      gtk_widget_queue_resize (GTK_WIDGET (root));
++  }
++  g_debug ("m52xq: call display %s layout", land ? "landscape" : "portrait");
++  return G_SOURCE_REMOVE;
++}
++
++static void
++m52xq_decide (CuiCallDisplay *self)
++{
++  GdkRectangle geo;
++  gboolean land;
++
++  if (!self->m52xq_monitor)
++    return;
++  gdk_monitor_get_geometry (self->m52xq_monitor, &geo);
++  land = geo.width > geo.height && geo.height < M52XQ_LANDSCAPE_MAX_H;
++  if (land == self->m52xq_landscape)
++    return;
++  g_debug ("m52xq: screen %dx%d -> %s", geo.width, geo.height, land ? "landscape" : "portrait");
++  self->m52xq_landscape = land;
++  if (!self->m52xq_layout_id)
++    self->m52xq_layout_id = g_idle_add_full (G_PRIORITY_HIGH_IDLE, m52xq_apply_layout,
++                                             g_object_ref (self), g_object_unref);
++}
++
++static void
++m52xq_on_geometry (GdkMonitor *monitor, GParamSpec *pspec, CuiCallDisplay *self)
++{
++  m52xq_decide (self);
++}
++
++static void
++m52xq_on_realize (GtkWidget *widget, CuiCallDisplay *self)
++{
++  GtkNative *native = gtk_widget_get_native (widget);
++  GdkSurface *surface = native ? gtk_native_get_surface (native) : NULL;
++  GdkMonitor *monitor = NULL;
++
++  if (surface)
++    monitor = gdk_display_get_monitor_at_surface (gdk_surface_get_display (surface), surface);
++  if (!monitor) {
++    GListModel *list = gdk_display_get_monitors (gtk_widget_get_display (widget));
++
++    if (g_list_model_get_n_items (list) > 0) {
++      monitor = g_list_model_get_item (list, 0);
++      g_object_unref (monitor);  /* the list keeps it */
++    }
++  }
++  if (!monitor || monitor == self->m52xq_monitor)
++    return;
++  if (self->m52xq_monitor) {
++    g_clear_signal_handler (&self->m52xq_geometry_handler, self->m52xq_monitor);
++    g_clear_object (&self->m52xq_monitor);
++  }
++  self->m52xq_monitor = g_object_ref (monitor);
++  self->m52xq_geometry_handler = g_signal_connect (monitor, "notify::geometry", G_CALLBACK (m52xq_on_geometry), self);
++  m52xq_decide (self);
++}
++
++static void
++m52xq_on_unrealize (GtkWidget *widget, CuiCallDisplay *self)
++{
++  if (self->m52xq_monitor) {
++    g_clear_signal_handler (&self->m52xq_geometry_handler, self->m52xq_monitor);
++    g_clear_object (&self->m52xq_monitor);
++  }
++}
++
+ 
+ /* Just print an error, the main point is that libcallaudio uses async DBus calls */
+ static void
+@@ -262,7 +391,7 @@
+   switch (state)
+   {
+   case CUI_CALL_STATE_INCOMING:
+-    adw_avatar_set_size (self->avatar, ADW_AVATAR_SIZE_BIG);
++    m52xq_set_avatar_size (self, ADW_AVATAR_SIZE_BIG);
+ 
+     gtk_widget_set_visible (GTK_WIDGET (self->controls), false);
+     gtk_widget_set_visible (GTK_WIDGET (self->answer), true);
+@@ -270,7 +399,7 @@
+     break;
+ 
+   case CUI_CALL_STATE_ACTIVE:
+-    adw_avatar_set_size (self->avatar, ADW_AVATAR_SIZE_DEFAULT);
++    m52xq_set_avatar_size (self, ADW_AVATAR_SIZE_DEFAULT);
+     G_GNUC_FALLTHROUGH;
+ 
+   case CUI_CALL_STATE_CALLING:
+@@ -412,7 +541,7 @@
+   self->update_status_time = TRUE;
+   adw_avatar_set_custom_image (self->avatar, NULL);
+   adw_avatar_set_text (self->avatar, "");
+-  adw_avatar_set_size (self->avatar, ADW_AVATAR_SIZE_DEFAULT);
++  m52xq_set_avatar_size (self, ADW_AVATAR_SIZE_DEFAULT);
+   gtk_label_set_label (self->primary_contact_info, "");
+   gtk_label_set_label (self->secondary_contact_info, "");
+   gtk_label_set_label (self->status, "");
+@@ -530,6 +659,9 @@
+ 
+   GtkWidget *overlay = GTK_WIDGET (self->overlay);
+ 
++  g_clear_handle_id (&self->m52xq_layout_id, g_source_remove); /* m52xq r104 */
++  m52xq_on_unrealize (NULL, self);                              /* m52xq r105 */
++
+   g_clear_pointer (&overlay, gtk_widget_unparent);
+ 
+   if (self->call) {
+@@ -594,6 +726,8 @@
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, secondary_contact_info);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, speaker);
+   gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, status);
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, main_box);   /* m52xq r104 */
++  gtk_widget_class_bind_template_child (widget_class, CuiCallDisplay, action_box); /* m52xq r104 */
+   gtk_widget_class_bind_template_callback (widget_class, add_call_clicked_cb);
+   gtk_widget_class_bind_template_callback (widget_class, block_delete_cb);
+   gtk_widget_class_bind_template_callback (widget_class, hide_dial_pad_clicked_cb);
+@@ -612,6 +746,33 @@
+ cui_call_display_init (CuiCallDisplay *self)
+ {
+   gtk_widget_init_template (GTK_WIDGET (self));
++
++  /*
++   * m52xq r107: the content in a scrolled window with an almost zero minimum size. GTK never makes a window smaller than
++   * its content: after a rotation the previous layout (horizontal ~830 wide, vertical ~600 high) enlarged the call
++   * window beyond the screen for a moment and it never shrank again (r106: content shifted right in portrait, the
++   * buttons below the screen in landscape). The scrolled window shows its natural size when it fits.
++   */
++  {
++    GtkWidget *content = GTK_WIDGET (self->main_box);
++    GtkWidget *sw = gtk_scrolled_window_new ();
++
++    g_object_ref (content);
++    gtk_overlay_set_child (self->overlay, NULL);
++    gtk_scrolled_window_set_policy (GTK_SCROLLED_WINDOW (sw), GTK_POLICY_AUTOMATIC, GTK_POLICY_AUTOMATIC);
++    gtk_scrolled_window_set_propagate_natural_width (GTK_SCROLLED_WINDOW (sw), TRUE);
++    gtk_scrolled_window_set_propagate_natural_height (GTK_SCROLLED_WINDOW (sw), TRUE);
++    gtk_widget_set_hexpand (sw, TRUE);
++    gtk_widget_set_vexpand (sw, TRUE);
++    gtk_scrolled_window_set_child (GTK_SCROLLED_WINDOW (sw), content);
++    gtk_overlay_set_child (self->overlay, sw);
++    g_object_unref (content);
++  }
++
++  /* m52xq r106: the layout follows the size of the screen (monitor) */
++  g_signal_connect (self, "realize", G_CALLBACK (m52xq_on_realize), self);
++  g_signal_connect (self, "unrealize", G_CALLBACK (m52xq_on_unrealize), self);
++
+   /* m52xq: initial look of the toggles */
+   m52xq_toggle_style (self->mute, M52XQ_MUTE_ICONS);
+   m52xq_toggle_style (self->speaker, NULL, NULL);
+diff -ruN a/subprojects/libcall-ui/src/cui-call-display.ui b/subprojects/libcall-ui/src/cui-call-display.ui
+--- a/subprojects/libcall-ui/src/cui-call-display.ui	2026-11-17 00:26:28.732894228 +0200
++++ b/subprojects/libcall-ui/src/cui-call-display.ui	2026-11-17 00:38:42.077473296 +0200
+@@ -9,7 +9,7 @@
+       <object class="GtkOverlay" id="overlay">
+         <property name="vexpand">True</property>
+         <property name="child">
+-          <object class="GtkBox">
++          <object class="GtkBox" id="main_box">
+             <property name="width-request">300</property>
+             <property name="sensitive" bind-source="dial_pad_revealer" bind-property="reveal-child" bind-flags="bidirectional|sync-create|invert-boolean"/>
+             <property name="halign">center</property>

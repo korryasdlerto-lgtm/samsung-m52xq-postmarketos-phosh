@@ -1,0 +1,33 @@
+# Maintainer: Asdlerto Korry <korryasdlerto@gmail.com>
+# m52xq: full-resolution photo helper (main camera 64 MP, front 32 MP) for camera apps that use PipeWire (Snapshot).
+# Port of the raw capture + GPU development of the m52xq plasma-camera build (r36).
+pkgname=m52xq-rawphoto
+pkgver=1
+pkgrel=3
+pkgdesc="Samsung Galaxy M52 5G: full-resolution raw photo capture and GPU development"
+url="https://github.com/korryasdlerto-lgtm/samsung-m52xq-postmarketos-phosh"
+arch="aarch64"
+license="GPL-2.0-or-later"
+makedepends="libcamera-dev libepoxy-dev libjpeg-turbo-dev linux-headers"
+source="m52xq-rawphoto.cpp rawphoto.c rawphoto.h photo_gpu.c photo_gpu.h"
+builddir="$srcdir"
+options="!check"
+
+build() {
+	gcc $CFLAGS -O2 -Wall -c rawphoto.c -o rawphoto.o $(pkg-config --cflags epoxy)
+	gcc $CFLAGS -O2 -Wall -c photo_gpu.c -o photo_gpu.o $(pkg-config --cflags epoxy libjpeg)
+	g++ $CXXFLAGS -O2 -Wall -std=c++20 -c m52xq-rawphoto.cpp -o m52xq-rawphoto.o $(pkg-config --cflags libcamera)
+	g++ $LDFLAGS -o m52xq-rawphoto m52xq-rawphoto.o rawphoto.o photo_gpu.o \
+		$(pkg-config --libs libcamera epoxy libjpeg) -lm
+}
+
+package() {
+	install -Dm755 m52xq-rawphoto "$pkgdir"/usr/bin/m52xq-rawphoto
+}
+sha512sums="
+8a7099dd35e12946e057a8bcc475ebd219f658afb372edbd993cad16098f7e687000570f7b9c585fe3dcf50e9668b68ad6727d324bbac291241274bc82c444b9  m52xq-rawphoto.cpp
+7d95cfae58429112cfb608602604a55d556f17a5443e65d6dde1419c8fda8337b8ec1758b71b7070b5deebb44d0f0071b7724b5331df245de73589719c62762f  rawphoto.c
+c650f9377cd758f79ffd633eedff67359e18399f7d965f3a6483c45bde1342e00ad399923d0011caa6925bdb119dcd9bcfadd2bc81a607f3cf5c454f95206ab4  rawphoto.h
+2907ab4334150f7f146e334d330651feea7983ba5887d0603846f9e5c586c03137b155ee415b2e529be531489314b9a2239603ed2e36e1012411579ad778af12  photo_gpu.c
+1a5a5dbfa2cbb74f2e9400b9918cb3fc7228866ea03e2b1dbb9249b5035ad23c1e9c905092819140b323f6bff3f303e2dbb56e5d38b5f8686b6b2d8ffafe3ccc  photo_gpu.h
+"

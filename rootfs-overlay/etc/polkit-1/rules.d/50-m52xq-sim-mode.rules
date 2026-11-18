@@ -1,0 +1,11 @@
+// M52XQ: the "SIM cards" and "Flight mode" buttons may start m52xq-sim-mode@<mode> / m52xq-flight-mode@on|off without a password (active local user);
+// m52xq-idle-suspend may start m52xq-bt-restore.service (Bluetooth back on after a dark wake-up that the user turned into a real one)
+polkit.addRule(function(action, subject) {
+	if (action.id == "org.freedesktop.systemd1.manage-units" &&
+	    action.lookup("verb") == "start" &&
+	    (/^m52xq-sim-mode@(dsds|sim1|sim2|data1|data2)\.service$/.test(action.lookup("unit")) ||
+	     /^m52xq-flight-mode@(on|off)\.service$/.test(action.lookup("unit")) ||
+	     action.lookup("unit") == "m52xq-bt-restore.service") &&
+	    subject.local && subject.active)
+		return polkit.Result.YES;
+});

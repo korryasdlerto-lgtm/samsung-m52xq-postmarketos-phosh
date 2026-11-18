@@ -1,0 +1,2424 @@
+diff --git a/aperture/src/camera.rs b/aperture/src/camera.rs
+index fbe0f06..f951654 100644
+--- a/aperture/src/camera.rs
++++ b/aperture/src/camera.rs
+@@ -155,7 +155,16 @@ impl Camera {
+         let caps = self
+             .caps()
+             .unwrap_or_else(|| gst::Caps::builder("video/x-raw").build());
+-        let highest_res_caps = utils::caps::filter_caps(caps);
++        let mut highest_res_caps = utils::caps::filter_caps(caps);
++        /*
++         * m52xq r124: no colorimetry in the request to PipeWire. With libcamera r101 (NV12 output) the camera node
++         * announces BT.709 (1:4:7:1) for its formats while the BGRx stream comes as sRGB: pipewiresrc intersected the
++         * two, handle_format_change failed (gst_caps_is_fixed) and the viewfinder waited for NEGOTIATED forever
++         * (2026-11-18, after a 1080p recording and at every start since).
++         */
++        for s in highest_res_caps.make_mut().iter_mut() {
++            s.remove_field("colorimetry");
++        }
+         log::debug!("Using caps: {highest_res_caps:#?}");
+ 
+         highest_res_caps
+diff --git a/aperture/src/lib.rs b/aperture/src/lib.rs
+index cb57112..113989e 100644
+--- a/aperture/src/lib.rs
++++ b/aperture/src/lib.rs
+@@ -23,6 +23,7 @@ mod code_detector;
+ mod device_provider;
+ mod enums;
+ mod error;
++mod m52xq_af;
+ mod pipeline_tee;
+ mod utils;
+ mod viewfinder;
+diff --git a/aperture/src/m52xq_af.rs b/aperture/src/m52xq_af.rs
+new file mode 100644
+index 0000000..6927ac3
+--- /dev/null
++++ b/aperture/src/m52xq_af.rs
+@@ -0,0 +1,404 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++//! m52xq: contrast autofocus for the rear main camera of the Samsung Galaxy M52 5G (s5kgw3 sensor with the
++//! fp5529 voice coil lens). Port of the plasma-camera LensAutofocus of this phone: hill climb over the lens
++//! position, the sharpness is the gradient energy of 4x4 block averages of the luma in a region of the frame
++//! (the middle 2/5 or, after a tap, a square of 1/5 of the frame around the tapped point).
++
++use std::fs::File;
++use std::os::fd::AsRawFd;
++use std::os::raw::{c_int, c_ulong};
++
++// Factory calibration of the rear main camera (EEPROM): 335 = infinity, 621 = macro.
++const INFINITY: i32 = 335;
++const MACRO: i32 = 621;
++// Frames to wait after moving the lens (VCM settling + pipeline latency).
++const SETTLE_FRAMES: i32 = 3;
++// default code of the fp5529 VCM: the peak for 1-3 m scenes lies right there (start of the search)
++const START: i32 = 345;
++const COARSE_STEP: i32 = 50;
++const FINE_STEP: i32 = 15;
++const FINE_SPAN: i32 = 40;
++// search again after a big change of the scene that lasts about 3 s (the lens must not hunt)
++const LOW_RATIO: f64 = 0.4;
++const LOW_FRAMES_TO_RETRIGGER: i32 = 45;
++const MEAN_CHANGE: f64 = 0.6;
++const HOLD_FRAMES_AFTER_CAPTURE: i32 = 90;
++
++// linux/videodev2.h
++const VIDIOC_S_CTRL: c_ulong = 0xC008_561C;
++const V4L2_CID_FOCUS_ABSOLUTE: u32 = 0x009a_090a;
++
++#[repr(C)]
++struct V4l2Control {
++    id: u32,
++    value: i32,
++}
++
++unsafe extern "C" {
++    fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
++}
++
++#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
++enum State {
++    #[default]
++    Disabled,
++    Settling,
++    Scanning,
++    Holding,
++}
++
++#[derive(Debug, Default)]
++pub struct LensAf {
++    lens: Option<File>,
++    available: bool,
++    state: State,
++    current: i32,
++    settle_frames: i32,
++    fine: bool,
++    stage: i32,
++    falling: i32,
++    dir: i32,
++    best_score: f64,
++    best_position: i32,
++    pos: i32,
++    fine_from: i32,
++    fine_to: i32,
++    last_locked: Option<i32>,
++    reference: f64,
++    reference_mean: f64,
++    low_frames: i32,
++    hold: i32,
++    roi: Option<(f64, f64)>,
++    /// m52xq r100: start of the running search (watchdog: a search may not take longer than 4 s)
++    search_started: Option<std::time::Instant>,
++}
++
++fn open_lens() -> Option<File> {
++    let dir = match std::fs::read_dir("/sys/class/video4linux") {
++        Ok(dir) => dir,
++        Err(err) => {
++            log::warn!("m52xq autofocus: cannot read /sys/class/video4linux: {err}");
++            return None;
++        }
++    };
++    for entry in dir.flatten() {
++        let name = entry.file_name();
++        let name = name.to_string_lossy();
++        if !name.starts_with("v4l-subdev") {
++            continue;
++        }
++        let Ok(dev_name) = std::fs::read_to_string(entry.path().join("name")) else {
++            continue;
++        };
++        if !dev_name.starts_with("fp5529") {
++            continue;
++        }
++        let path = format!("/dev/{name}");
++        match std::fs::OpenOptions::new().read(true).write(true).open(&path) {
++            Ok(file) => {
++                log::info!("m52xq autofocus: using lens {path}");
++                return Some(file);
++            }
++            Err(err) => log::warn!("m52xq autofocus: cannot open {path}: {err}"),
++        }
++    }
++    log::warn!("m52xq autofocus: no fp5529 lens among the v4l-subdev devices");
++    None
++}
++
++impl LensAf {
++    pub fn available(&self) -> bool {
++        self.available
++    }
++
++    pub fn is_searching(&self) -> bool {
++        matches!(self.state, State::Settling | State::Scanning)
++    }
++
++    /// Called for every camera change: `is_lens_camera` tells whether the camera has the lens.
++    pub fn set_camera(&mut self, is_lens_camera: bool) {
++        self.roi = None;
++        if !is_lens_camera {
++            self.available = false;
++            self.state = State::Disabled;
++            return;
++        }
++        if self.lens.is_none() {
++            self.lens = open_lens();
++        }
++        self.available = self.lens.is_some();
++        if self.available {
++            self.start_scan();
++        } else {
++            self.state = State::Disabled;
++        }
++    }
++
++    fn set_position(&mut self, position: i32) {
++        let Some(lens) = self.lens.as_ref() else {
++            return;
++        };
++        let position = position.clamp(0, 1023);
++        let mut ctrl = V4l2Control {
++            id: V4L2_CID_FOCUS_ABSOLUTE,
++            value: position,
++        };
++        // SAFETY: VIDIOC_S_CTRL takes a pointer to a struct v4l2_control that lives during the call
++        let ret = unsafe { ioctl(lens.as_raw_fd(), VIDIOC_S_CTRL, &mut ctrl as *mut V4l2Control) };
++        if ret < 0 {
++            log::warn!(
++                "m52xq autofocus: VIDIOC_S_CTRL failed: {}",
++                std::io::Error::last_os_error()
++            );
++            return;
++        }
++        self.current = position;
++    }
++
++    /// Focus on the point (u, v) of the frame, 0..1 each.
++    pub fn focus_at(&mut self, u: f64, v: f64) {
++        if !self.available {
++            return;
++        }
++        self.roi = Some((u.clamp(0.0, 1.0), v.clamp(0.0, 1.0)));
++        self.hold = 0;
++        log::info!("m52xq autofocus: tap at {u:.2} {v:.2}");
++        // m52xq r100: a tap is a new subject: search from the start position like a fresh start of the classic port
++        // (from the last lock near the macro end the search never reached far subjects)
++        self.last_locked = None;
++        self.start_scan();
++    }
++
++    pub fn capture_started(&mut self) {
++        if !self.available {
++            return;
++        }
++        if self.is_searching() {
++            // in the middle of the search: go to the best position found so far
++            let target = if self.best_score > 0.0 {
++                self.best_position
++            } else {
++                self.pos
++            };
++            self.finish_search(target);
++        }
++        self.hold = HOLD_FRAMES_AFTER_CAPTURE;
++    }
++
++    fn move_to(&mut self, position: i32) {
++        self.set_position(position.clamp(INFINITY, MACRO));
++        self.settle_frames = SETTLE_FRAMES;
++        self.state = State::Settling;
++    }
++
++    fn start_scan(&mut self) {
++        self.search_started = Some(std::time::Instant::now());
++        self.fine = false;
++        self.stage = 0;
++        self.falling = 0;
++        self.dir = 1;
++        self.best_score = 0.0;
++        self.best_position = self.last_locked.unwrap_or(START);
++        self.pos = self.best_position;
++        self.low_frames = 0;
++        self.move_to(self.pos);
++    }
++
++    fn finish_search(&mut self, position: i32) {
++        self.best_position = position.clamp(INFINITY, MACRO);
++        self.last_locked = Some(self.best_position);
++        self.set_position(self.best_position);
++        self.reference = 0.0;
++        self.settle_frames = SETTLE_FRAMES;
++        self.state = State::Holding;
++        let took = self.search_started.take().map(|t| t.elapsed().as_millis()).unwrap_or(0);
++        log::info!("m52xq autofocus: locked at {} after {took} ms", self.best_position);
++    }
++
++    fn evaluate(&mut self, score: f64) {
++        log::info!("m52xq autofocus: {} {} score {score:.2}", if self.fine { "fine" } else { "coarse" }, self.pos);
++        if !self.fine {
++            if score > self.best_score {
++                self.best_score = score;
++                self.best_position = self.pos;
++                self.falling = 0;
++            } else if score < self.best_score * 0.85 {
++                self.falling += 1;
++            }
++            self.stage += 1;
++            // the first step away from the start decides the direction
++            if self.stage == 2 && self.dir > 0 && score < self.best_score * 0.95 {
++                self.dir = -1;
++                self.falling = 0;
++                self.pos = (self.best_position - COARSE_STEP).max(INFINITY);
++                self.move_to(self.pos);
++                return;
++            }
++            let next = self.pos + COARSE_STEP * self.dir;
++            if self.falling >= 2 || next > MACRO || next < INFINITY {
++                // behind the peak (or at the end of the range): fine scan around the best position
++                self.fine = true;
++                self.fine_from = (self.best_position - FINE_SPAN).max(INFINITY);
++                self.fine_to = (self.best_position + FINE_SPAN).min(MACRO);
++                self.best_score = 0.0;
++                self.pos = self.fine_from;
++                self.move_to(self.pos);
++                return;
++            }
++            self.pos = next;
++            self.move_to(self.pos);
++            return;
++        }
++
++        if score > self.best_score {
++            self.best_score = score;
++            self.best_position = self.pos;
++        }
++        if self.pos >= self.fine_to {
++            self.finish_search(self.best_position);
++            return;
++        }
++        self.pos = (self.pos + FINE_STEP).min(self.fine_to);
++        self.move_to(self.pos);
++    }
++
++    /// Feeds one frame: the luma (or another 8 bit component) at `data[offset + y * stride + x * pstride]`.
++    /// Returns true when the searching state changed (to redraw the focus mark).
++    pub fn process_frame(
++        &mut self,
++        data: &[u8],
++        stride: usize,
++        pstride: usize,
++        offset: usize,
++        width: usize,
++        height: usize,
++    ) -> bool {
++        if self.state == State::Disabled {
++            return false;
++        }
++        if self.hold > 0 {
++            self.hold -= 1;
++            return false;
++        }
++        let was_searching = self.is_searching();
++        if self.settle_frames > 0 && self.state != State::Scanning {
++            self.settle_frames -= 1;
++            if self.settle_frames > 0 {
++                return false;
++            }
++            if self.state == State::Settling {
++                self.state = State::Scanning;
++            }
++        }
++
++        let Some((score, mean)) =
++            sharpness(data, stride, pstride, offset, width, height, self.roi)
++        else {
++            return false;
++        };
++
++        // m52xq r100: watchdog
++        if self.is_searching()
++            && self.search_started.is_some_and(|t| t.elapsed() > std::time::Duration::from_secs(4))
++        {
++            log::warn!("m52xq autofocus: search took more than 4 s, taking the best position so far");
++            let target = if self.best_score > 0.0 { self.best_position } else { self.pos };
++            self.finish_search(target);
++            return true;
++        }
++
++        match self.state {
++            State::Scanning => self.evaluate(score),
++            State::Holding => {
++                if self.reference <= 0.0 {
++                    self.reference = score;
++                    self.reference_mean = mean;
++                    self.low_frames = 0;
++                } else if score < self.reference * LOW_RATIO
++                    || (mean - self.reference_mean).abs() > self.reference_mean * MEAN_CHANGE
++                {
++                    self.low_frames += 1;
++                    if self.low_frames >= LOW_FRAMES_TO_RETRIGGER {
++                        log::info!("m52xq autofocus: scene changed, searching again");
++                        self.roi = None;
++                        self.start_scan();
++                    }
++                } else {
++                    self.low_frames = 0;
++                }
++            }
++            _ => (),
++        }
++        was_searching != self.is_searching()
++    }
++}
++
++fn sharpness(
++    data: &[u8],
++    stride: usize,
++    pstride: usize,
++    offset: usize,
++    width: usize,
++    height: usize,
++    roi: Option<(f64, f64)>,
++) -> Option<(f64, f64)> {
++    if width < 64 || height < 64 || pstride == 0 {
++        return None;
++    }
++    let (roi_w, roi_h, x0, y0) = match roi {
++        Some((u, v)) => {
++            let rw = (width / 5) & !3;
++            let rh = (height / 5) & !3;
++            let x0 = ((u * width as f64) as isize - rw as isize / 2).clamp(0, (width - rw) as isize)
++                as usize
++                & !3;
++            let y0 = ((v * height as f64) as isize - rh as isize / 2)
++                .clamp(0, (height - rh) as isize) as usize
++                & !3;
++            (rw, rh, x0, y0)
++        }
++        None => {
++            let rw = (width * 2 / 5) & !3;
++            let rh = (height * 2 / 5) & !3;
++            (rw, rh, ((width - rw) / 2) & !3, ((height - rh) / 2) & !3)
++        }
++    };
++    let bw = roi_w / 4;
++    let bh = roi_h / 4;
++    // the last byte read must be inside the buffer
++    let last = offset + (y0 + bh * 4 - 1) * stride + (x0 + bw * 4 - 1) * pstride;
++    if bw < 2 || bh < 2 || last >= data.len() {
++        return None;
++    }
++
++    let mut blocks = vec![0f32; bw * bh];
++    let mut sum = 0f64;
++    for by in 0..bh {
++        for bx in 0..bw {
++            let mut acc = 0u32;
++            for j in 0..4 {
++                let line = offset + (y0 + by * 4 + j) * stride + (x0 + bx * 4) * pstride;
++                for i in 0..4 {
++                    acc += data[line + i * pstride] as u32;
++                }
++            }
++            let value = acc as f32 / 16.0;
++            blocks[by * bw + bx] = value;
++            sum += value as f64;
++        }
++    }
++    let mean = sum / (bw * bh) as f64;
++    let mut energy = 0f64;
++    for by in 0..bh - 1 {
++        for bx in 0..bw - 1 {
++            let here = blocks[by * bw + bx] as f64;
++            let gx = blocks[by * bw + bx + 1] as f64 - here;
++            let gy = blocks[(by + 1) * bw + bx] as f64 - here;
++            energy += gx * gx + gy * gy;
++        }
++    }
++    Some((
++        energy / (bw * bh) as f64 / (mean * mean).max(1.0) * 1000.0,
++        mean,
++    ))
++}
+diff --git a/aperture/src/utils.rs b/aperture/src/utils.rs
+index 72ab13b..bd81c7a 100644
+--- a/aperture/src/utils.rs
++++ b/aperture/src/utils.rs
+@@ -29,10 +29,21 @@ pub(crate) mod caps {
+         caps.intersect_with_mode(&crate::SUPPORTED_CAPS, gst::CapsIntersectMode::First)
+     }
+ 
++    /// m52xq r110: the frame height the viewfinder wants now (1080, or 2160 for 4K video)
++    pub(crate) static M52XQ_WANTED_HEIGHT: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1080);
++
+     pub(crate) fn best_mode(caps: &gst::Caps) -> Option<Size> {
+         const MIN_WIDTH: i32 = 640;
+         const MIN_HEIGHT: i32 = 480;
+-        const MAX_HEIGHT: i32 = 1080;
++        // m52xq r109: 4K (2160p) through PipeWire, as the 4K of the pmOS Lomiri port (003); M52XQ_MAX_HEIGHT=1080 gives
++        // the old limit back without a rebuild
++        // m52xq r110 (as the 4K of Ubuntu Touch 003): 2160 only in the video mode with the "4K Video" setting
++        // (M52XQ_WANTED_HEIGHT, set by the viewfinder), 1080 otherwise; M52XQ_MAX_HEIGHT stays an upper limit
++        let max_height: i32 = std::env::var("M52XQ_MAX_HEIGHT")
++            .ok()
++            .and_then(|s| s.parse().ok())
++            .unwrap_or(2160)
++            .min(M52XQ_WANTED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed));
+         const OPTIMAL_RATIO: f32 = 16.0 / 9.0;
+ 
+         let mut best_size_optimal_ratio: Option<Size> = None;
+@@ -53,7 +64,7 @@ pub(crate) mod caps {
+ 
+             let max_width = (height as f32 * OPTIMAL_RATIO).ceil() as i32;
+             if (MIN_WIDTH..=max_width).contains(&width)
+-                && (MIN_HEIGHT..=MAX_HEIGHT).contains(&height)
++                && (MIN_HEIGHT..=max_height).contains(&height)
+             {
+                 if width == (height as f32 * OPTIMAL_RATIO) as i32 {
+                     if let Some(Size {
+diff --git a/aperture/src/viewfinder.rs b/aperture/src/viewfinder.rs
+index 7209cb5..8149f9e 100644
+--- a/aperture/src/viewfinder.rs
++++ b/aperture/src/viewfinder.rs
+@@ -4,6 +4,7 @@ use std::path::PathBuf;
+ use std::sync::LazyLock;
+ 
+ use gst::prelude::*;
++use gst_video::prelude::VideoFrameExt;
+ use gtk::prelude::*;
+ use gtk::subclass::prelude::*;
+ use gtk::{gdk, gio, glib, graphene};
+@@ -19,6 +20,173 @@ use crate::code_detector::QrCodeDetector;
+ const DEFAULT_BITRATE: u32 = 2048;
+ const PROVIDER_TIMEOUT: u64 = 2;
+ 
++/// m52xq r118/r120: caps of libcamerasrc for 4K, try n: 3840x2160 NV12 (libcamera r101 GPU debayer; BGRx as m52xqcamsrc
++/// of 003 when the libcamera has no NV12) at 30, 25, 24, 20, 15 fps
++fn m52xq_lc_caps(n: u32) -> gst::Caps {
++    const RATES: [i32; 5] = [30, 25, 24, 20, 15];
++    /*
++     * m52xq r119: the first try is a list (fixation takes 30, libcamerasrc clamps it to FrameDurationLimits: front
++     * imx616 4K = full 6528x4896 readout, 25 fps). r117 got 10/1 from the list only because of the libcamera 0.8 bug
++     * (stale sensor info in the soft IPA) fixed in libcamera r100. Later tries: one fixed rate each.
++     */
++    if n == 0 {
++        log::info!("m52xq: libcamerasrc 3840x2160 at 30/25/24/20/15 fps (list)");
++        let rates: Vec<gst::Fraction> = RATES.iter().map(|&r| gst::Fraction::new(r, 1)).collect();
++        return gst::Caps::builder("video/x-raw")
++            .field("format", gst::List::new(["NV12", "BGRx"]))
++            .field("width", 3840)
++            .field("height", 2160)
++            .field("framerate", gst::List::new(rates))
++            .build();
++    }
++    let fps = RATES[n as usize % RATES.len()];
++    log::info!("m52xq: libcamerasrc 3840x2160 at {fps} fps");
++    gst::Caps::builder("video/x-raw")
++        .field("format", gst::List::new(["NV12", "BGRx"]))
++        .field("width", 3840)
++        .field("height", 2160)
++        .field("framerate", gst::Fraction::new(fps, 1))
++        .build()
++}
++
++/// m52xq r125: video-capture-caps of camerabin: NV12 first for the 4K libcamerasrc (NV12 from the GPU debayer, no CPU
++/// conversion), I420 first for PipeWire (BGRx: one conversion, the restart after a recording negotiates)
++fn m52xq_video_caps(nv12_first: bool) -> gst::Caps {
++    let formats = if nv12_first {
++        [gst_video::VideoFormat::Nv12, gst_video::VideoFormat::I420]
++    } else {
++        [gst_video::VideoFormat::I420, gst_video::VideoFormat::Nv12]
++    };
++    gst_video::video_make_raw_caps(&formats).build()
++}
++
++/// m52xq r109: QP of the Venus encoder, M52XQ_VENC_QP="I,P" (as the pmOS Lomiri port 003), default 38/40.
++/// m52xq r121: 4K has its own M52XQ_VENC_QP_4K, default 46/48 - with 38/40 a 4K recording was ~320 Mbit/s
++/// (15.6 GB in 6.5 min, 2026-11-18; Venus rate control is off: it crashed the firmware at >= 1080p).
++fn m52xq_venc_qp() -> (i32, i32) {
++    let is_4k = crate::utils::caps::M52XQ_WANTED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) >= 2160;
++    // m52xq r123: the venus driver now really passes the QP to Iris2 (CONFIG_VENC_FRAME_QP, kernel fix 2026-11-18;
++    // before, the QP never reached the firmware): 4K 34/36 ~47 Mbit/s (as the stock firmware), 1080p 32/34
++    let (var, def) = if is_4k { ("M52XQ_VENC_QP_4K", (34, 36)) } else { ("M52XQ_VENC_QP", (32, 34)) };
++    std::env::var(var)
++        .ok()
++        .and_then(|s| {
++            let (i, p) = s.split_once(',')?;
++            Some((i.trim().parse().ok()?, p.trim().parse().ok()?))
++        })
++        .filter(|&(i, p): &(i32, i32)| (1..=51).contains(&i) && (1..=51).contains(&p))
++        .unwrap_or(def)
++}
++
++/// m52xq: a videoflip element, no rotation at start.
++fn m52xq_make_flip() -> gst::Element {
++    let flip = gst::ElementFactory::make("videoflip")
++        .build()
++        .expect("Missing GStreamer Good Plug-ins (videoflip)");
++    flip.set_property_from_str("video-direction", "identity");
++    flip
++}
++
++/// m52xq: bin "videoflip ! videocrop ! <convert>" used as camerabin image/video filter; the videocrop cuts
++/// the middle of the frame by the pinch zoom of the viewfinder.
++fn m52xq_flip_bin(
++    convert: &gst::Element,
++    zoom: &std::sync::Arc<std::sync::atomic::AtomicU64>,
++) -> (gst::Element, gst::Element, gst::Element) {
++    let flip = m52xq_make_flip();
++    let crop = gst::ElementFactory::make("videocrop")
++        .build()
++        .expect("Missing GStreamer Good Plug-ins (videocrop)");
++    let bin = gst::Bin::default();
++    bin.add(&flip).unwrap();
++    bin.add(&crop).unwrap();
++    bin.add(convert).unwrap();
++    flip.link(&crop).unwrap();
++    crop.link(convert).unwrap();
++    // a new frame size (image capture caps, other camera): recompute the crop with the current zoom
++    let zoom = zoom.clone();
++    crop.static_pad("sink").unwrap().add_probe(
++        gst::PadProbeType::EVENT_DOWNSTREAM,
++        move |pad, info| {
++            if let Some(gst::PadProbeData::Event(event)) = &info.data
++                && let gst::EventView::Caps(caps) = event.view()
++                && let Some(crop) = pad.parent_element()
++            {
++                m52xq_set_crop(&crop, caps.caps(), m52xq_zoom_value(&zoom));
++            }
++            gst::PadProbeReturn::Ok
++        },
++    );
++    bin.add_pad(&gst::GhostPad::with_target(&flip.static_pad("sink").unwrap()).unwrap())
++        .unwrap();
++    bin.add_pad(&gst::GhostPad::with_target(&convert.static_pad("src").unwrap()).unwrap())
++        .unwrap();
++    (bin.upcast(), flip, crop)
++}
++
++fn m52xq_zoom_value(zoom: &std::sync::atomic::AtomicU64) -> f64 {
++    f64::from_bits(zoom.load(std::sync::atomic::Ordering::Relaxed)).max(1.0)
++}
++
++/// m52xq: crop the middle 1/zoom of a frame of `caps`; the result stays a multiple of 16 pixels (encoders).
++fn m52xq_set_crop(crop: &gst::Element, caps: &gst::CapsRef, zoom: f64) {
++    let Some(s) = caps.structure(0) else {
++        return;
++    };
++    let (Ok(w), Ok(h)) = (s.get::<i32>("width"), s.get::<i32>("height")) else {
++        return;
++    };
++    m52xq_set_crop_size(crop, w, h, zoom);
++}
++
++/// m52xq r108: the frame size the crop will get = the size into its videoflip turned by the flip's CURRENT
++/// direction. The negotiated caps of the crop are stale after a display rotation (1920x1080 cut l544 r544 on a
++/// 1080 wide frame: not-negotiated, the front camera photo hung on 2026-11-17).
++fn m52xq_crop_input_size(crop: &gst::Element) -> Option<(i32, i32)> {
++    let flip = crop.static_pad("sink")?.peer()?.parent_element()?;
++    let caps = flip.static_pad("sink")?.current_caps()?;
++    let s = caps.structure(0)?;
++    let (w, h) = (s.get::<i32>("width").ok()?, s.get::<i32>("height").ok()?);
++    let dir = flip.property::<gst_video::VideoOrientationMethod>("video-direction");
++    Some(match dir {
++        gst_video::VideoOrientationMethod::_90r
++        | gst_video::VideoOrientationMethod::_90l
++        | gst_video::VideoOrientationMethod::UlLr
++        | gst_video::VideoOrientationMethod::UrLl => (h, w),
++        _ => (w, h),
++    })
++}
++
++fn m52xq_set_crop_size(crop: &gst::Element, w: i32, h: i32, zoom: f64) {
++    let side = |full: i32| -> (i32, i32) {
++        if zoom <= 1.001 || full < 64 {
++            return (0, 0);
++        }
++        let out = (((full as f64) / zoom) as i32 & !15).max(16);
++        let first = ((full - out) / 2) & !1;
++        (first, full - out - first)
++    };
++    let (left, right) = side(w);
++    let (top, bottom) = side(h);
++    crop.set_property("left", left);
++    crop.set_property("right", right);
++    crop.set_property("top", top);
++    crop.set_property("bottom", bottom);
++    log::debug!("m52xq: zoom {zoom:.2}, frame {w}x{h}, crop l{left} r{right} t{top} b{bottom}");
++}
++
++/// m52xq: the autofocus branch of the viewfinder tee: the newest frame only, pulled by a timer.
++fn m52xq_make_af_sink() -> gst::Element {
++    gst::ElementFactory::make("appsink")
++        .property("sync", false)
++        .property("async", false)
++        .property("max-buffers", 1u32)
++        .property("drop", true)
++        .property("enable-last-sample", false)
++        .build()
++        .expect("Missing GStreamer Base Plug-ins (appsink)")
++}
++
+ #[derive(Debug)]
+ enum StateChangeState {
+     Equal,
+@@ -67,11 +235,54 @@ mod imp {
+         pub is_stopping_recording: Cell<bool>,
+         pub is_taking_picture: Cell<bool>,
+         pub is_front_camera: Cell<bool>,
++        /// m52xq: display transform of the logical monitor 0..3 (orientation of the full-resolution photos)
++        pub m52xq_display_transform: Cell<u32>,
++        /// m52xq r103: the live viewfinder paintable while a still frame is shown during a full-resolution photo
++        pub m52xq_live_paintable: RefCell<Option<gdk::Paintable>>,
+ 
+         pub timeout_handler: RefCell<Option<glib::SourceId>>,
+ 
+         pub picture: gtk::Picture,
+         pub offload: gtk::GraphicsOffload,
++
++        /// m52xq: videoflip elements of the viewfinder, image and video branches; they turn the frames by the
++        /// rotation of the display (Phosh org.gnome.Mutter.DisplayConfig), so the preview, the pictures and the
++        /// videos stay upright in landscape too.
++        pub m52xq_flips: RefCell<Vec<gst::Element>>,
++        /// m52xq r104: the flip of the recording branch and the orientation tag written instead of a quarter turn
++        pub m52xq_video_flip: RefCell<Option<gst::Element>>,
++        pub m52xq_video_orientation: Cell<&'static str>,
++        /// m52xq r110: "4K Video" setting and the video capture mode (4K only when both are on)
++        pub m52xq_video_4k: Cell<bool>,
++        pub m52xq_video_mode: Cell<bool>,
++        /// m52xq r114: the framerate capsfilter of the recording branch (24 fps for 4K set before the recording)
++        pub m52xq_rate_caps: OnceCell<gst::Element>,
++        /// m52xq r115: libcamerasrc used instead of pipewiresrc for 4K (as Ubuntu Touch 003; PipeWire stalled 4K)
++        pub m52xq_lc_src: RefCell<Option<gst::Element>>,
++        pub m52xq_lc_retries: Cell<u32>,
++        /// m52xq r125: retries of the PipeWire source (CSID still busy right after libcamerasrc: "Resource busy")
++        pub m52xq_pw_retries: Cell<u32>,
++        pub m52xq_pw_retry_pending: Cell<bool>,
++        /// m52xq r116: taginject after libcamerasrc (the image-orientation tag PipeWire gives, libcamerasrc does not)
++        pub m52xq_lc_tag: RefCell<Option<gst::Element>>,
++        pub m52xq_display_proxy: RefCell<Option<gio::DBusProxy>>,
++
++        /// m52xq: pinch zoom of the viewfinder (1..4); the image and video branches crop the same part
++        pub m52xq_zoom: std::sync::Arc<std::sync::atomic::AtomicU64>,
++        pub m52xq_zoom_base: Cell<f64>,
++        pub m52xq_zooming: Cell<bool>,
++        pub m52xq_zoom_end: Cell<Option<std::time::Instant>>,
++        pub m52xq_crops: RefCell<Vec<gst::Element>>,
++        /// m52xq: contrast autofocus with the fp5529 lens of the main camera, tap to focus
++        pub m52xq_af: RefCell<crate::m52xq_af::LensAf>,
++        pub m52xq_af_sink: OnceCell<gst::Element>,
++        pub m52xq_mark: Cell<Option<(f32, f32)>>,
++        pub m52xq_mark_until: Cell<Option<std::time::Instant>>,
++        /// m52xq r98: a picture asked for while the lens searches: (path, deadline, lock time)
++        pub m52xq_pending_capture: RefCell<Option<(std::path::PathBuf, std::time::Instant, Option<std::time::Instant>)>>,
++        /// m52xq: time of the tap (the focus square shrinks onto the point like in the classic port)
++        pub m52xq_mark_start: Cell<Option<std::time::Instant>>,
++        pub m52xq_gestures_attached: Cell<bool>,
+     }
+ 
+     impl Viewfinder {
+@@ -235,6 +446,27 @@ mod imp {
+                 .build()
+                 .expect("Missing GStreamer Bad Plug-ins");
+             self.camerabin.set(camerabin.clone()).unwrap();
++            /*
++             * m52xq r112: 4K recording jerked (2026-11-17: bursts of 33 ms frames, 300 ms stalls) - every videoconvert
++             * in camerabin (the src-videoconvert of wrappercamerabinsrc runs in the camera thread) converted 4K frames
++             * on ONE core; the M52 has 8. M52XQ_VCONV_THREADS (default 4) threads for each of them.
++             */
++            let vconv_threads: u32 = std::env::var("M52XQ_VCONV_THREADS")
++                .ok()
++                .and_then(|s| s.parse().ok())
++                .unwrap_or(4);
++            camerabin
++                .downcast_ref::<gst::Bin>()
++                .unwrap()
++                .connect_deep_element_added(move |_, _, element| {
++                    if element
++                        .factory()
++                        .is_some_and(|f| f.name() == "videoconvert")
++                    {
++                        element.set_property("n-threads", vconv_threads);
++                        log::debug!("m52xq: {} n-threads {vconv_threads}", element.name());
++                    }
++                });
+ 
+             let bus = self.camerabin().bus().unwrap();
+             let watch = bus
+@@ -309,24 +541,185 @@ mod imp {
+             };
+ 
+             tee.add_branch(&sink);
++            // m52xq: frames for the autofocus
++            let af_sink = super::m52xq_make_af_sink();
++            tee.add_branch(&af_sink);
++            self.m52xq_af_sink.set(af_sink).unwrap();
+             camerabin.set_property("viewfinder-sink", &tee);
+ 
++            // m52xq: turn the preview by the display rotation
++            let flip_viewfinder = super::m52xq_make_flip();
++            /*
++             * m52xq r111: 4K video (2026-11-17) was a slide show, the recording too (bursts of 15 frames, then 300 ms
++             * stalls): the viewfinder path (flip of a 4K frame on the CPU + cairo drawing) ran in the thread of the
++             * camera and held its buffers. A leaky one-frame queue keeps the camera from waiting for the viewfinder;
++             * frames >= 3000 px wide are scaled down to a half (nearest neighbour, cheap) before the flip, the
++             * drawing and the autofocus.
++             */
++            let viewfinder_filter = {
++                let queue = gst::ElementFactory::make("queue")
++                    .property_from_str("leaky", "downstream")
++                    .property("max-size-buffers", 1u32)
++                    .property("max-size-bytes", 0u32)
++                    .property("max-size-time", 0u64)
++                    .build()
++                    .unwrap();
++                // m52xq r122: the 4K viewfinder at most 15 fps (the main thread drew every frame at 100 % CPU)
++                let vf_rate = gst::ElementFactory::make("videorate")
++                    .property("drop-only", true)
++                    .build()
++                    .expect("Missing GStreamer Base Plug-ins (videorate)");
++                let vf_rate_probe = vf_rate.clone();
++                vf_rate.static_pad("sink").unwrap().add_probe(
++                    gst::PadProbeType::EVENT_DOWNSTREAM,
++                    move |_, info| {
++                        if let Some(gst::PadProbeData::Event(event)) = &info.data
++                            && let gst::EventView::Caps(caps) = event.view()
++                            && let Some(s) = caps.caps().structure(0)
++                        {
++                            let w = s.get::<i32>("width").unwrap_or(0);
++                            vf_rate_probe.set_property("max-rate", if w >= 3000 { 15 } else { i32::MAX });
++                        }
++                        gst::PadProbeReturn::Ok
++                    },
++                );
++                let scale = gst::ElementFactory::make("videoscale")
++                    .property_from_str("method", "nearest-neighbour")
++                    .build()
++                    .expect("Missing GStreamer Base Plug-ins (videoscale)");
++                let scale_caps = gst::ElementFactory::make("capsfilter").build().unwrap();
++                let scale_caps_probe = scale_caps.clone();
++                scale.static_pad("sink").unwrap().add_probe(
++                    gst::PadProbeType::EVENT_DOWNSTREAM,
++                    move |_, info| {
++                        if let Some(gst::PadProbeData::Event(event)) = &info.data
++                            && let gst::EventView::Caps(caps) = event.view()
++                            && let Some(s) = caps.caps().structure(0)
++                        {
++                            let w = s.get::<i32>("width").unwrap_or(0);
++                            let h = s.get::<i32>("height").unwrap_or(0);
++                            // m52xq r122: a quarter (960x540) for 4K - conversion to RGB and cairo drawing 4 times cheaper
++                            let caps = if w >= 3000 {
++                                gst::Caps::builder("video/x-raw")
++                                    .field("width", w / 4)
++                                    .field("height", h / 4)
++                                    .build()
++                            } else {
++                                gst::Caps::new_any()
++                            };
++                            scale_caps_probe.set_property("caps", caps);
++                        }
++                        gst::PadProbeReturn::Ok
++                    },
++                );
++                let bin = gst::Bin::default();
++                bin.add_many([&queue, &vf_rate, &scale, &scale_caps, &flip_viewfinder]).unwrap();
++                gst::Element::link_many([&queue, &vf_rate, &scale, &scale_caps, &flip_viewfinder]).unwrap();
++                bin.add_pad(
++                    &gst::GhostPad::builder_with_target(&queue.static_pad("sink").unwrap())
++                        .unwrap()
++                        .name("sink")
++                        .build(),
++                )
++                .unwrap();
++                bin.add_pad(
++                    &gst::GhostPad::builder_with_target(&flip_viewfinder.static_pad("src").unwrap())
++                        .unwrap()
++                        .name("src")
++                        .build(),
++                )
++                .unwrap();
++                bin.upcast::<gst::Element>()
++            };
++            camerabin.set_property("viewfinder-filter", &viewfinder_filter);
++            self.m52xq_flips.borrow_mut().push(flip_viewfinder);
++
++            // m52xq r112: several threads here too (a bin added with its children is not seen by deep-element-added)
+             let videoconvert_video = gst::ElementFactory::make("videoconvert")
++                .property("n-threads", vconv_threads)
+                 .build()
+                 .expect("Missing GStreamer Base Plug-ins");
+-            camerabin.set_property("video-filter", &videoconvert_video);
+-
+-            let caps_video = gst_video::video_make_raw_caps(&[
+-                gst_video::VideoFormat::I420,
+-                gst_video::VideoFormat::Nv12,
+-            ])
+-            .build();
+-            camerabin.set_property("video-capture-caps", caps_video);
++            // m52xq r105: a steady 30 fps with clean timestamps in front of the encoder. With the Venus encoder
++            // (v4l2h264enc) the recording died at once: qtmux "Buffer has no PTS" -> camerabin abort (2026-11-17), while
++            // the CPU colour conversion lagged ("too many pending frames") and pipewire buffers were held.
++            let video_rate_bin = {
++                let rate = gst::ElementFactory::make("videorate")
++                    .property("drop-only", true)
++                    .build()
++                    .expect("Missing GStreamer Base Plug-ins (videorate)");
++                let rate_caps = gst::ElementFactory::make("capsfilter")
++                    .property(
++                        "caps",
++                        gst::Caps::builder("video/x-raw")
++                            .field("framerate", gst::Fraction::new(30, 1))
++                            .build(),
++                    )
++                    .build()
++                    .unwrap();
++                // m52xq r109 (as m52xqvenc of the pmOS Lomiri port 003): Venus cannot take 4K at 30 fps ("HW can't
++                // support this load") -> frames >= 3000 px wide are limited to 24 fps; the frames are dropped BEFORE
++                // the CPU conversion (videorate ! capsfilter ! videoconvert), the limit follows the CAPS event.
++                self.m52xq_rate_caps.set(rate_caps.clone()).unwrap();
++                let rate_caps_probe = rate_caps.clone();
++                rate.static_pad("sink").unwrap().add_probe(
++                    gst::PadProbeType::EVENT_DOWNSTREAM,
++                    move |_, info| {
++                        if let Some(gst::PadProbeData::Event(event)) = &info.data
++                            && let gst::EventView::Caps(caps) = event.view()
++                            && let Some(s) = caps.caps().structure(0)
++                        {
++                            let w = s.get::<i32>("width").unwrap_or(0);
++                            let fps = if w >= 3000 { 24 } else { 30 };
++                            rate_caps_probe.set_property(
++                                "caps",
++                                gst::Caps::builder("video/x-raw")
++                                    .field("framerate", gst::Fraction::new(fps, 1))
++                                    .build(),
++                            );
++                            log::info!("m52xq: recording {w} px wide, {fps} fps");
++                        }
++                        gst::PadProbeReturn::Ok
++                    },
++                );
++                let bin = gst::Bin::default();
++                bin.add_many([&rate, &rate_caps, &videoconvert_video]).unwrap();
++                gst::Element::link_many([&rate, &rate_caps, &videoconvert_video]).unwrap();
++                bin.add_pad(
++                    &gst::GhostPad::builder_with_target(&rate.static_pad("sink").unwrap())
++                        .unwrap()
++                        .name("sink")
++                        .build(),
++                )
++                .unwrap();
++                bin.add_pad(
++                    &gst::GhostPad::builder_with_target(&videoconvert_video.static_pad("src").unwrap())
++                        .unwrap()
++                        .name("src")
++                        .build(),
++                )
++                .unwrap();
++                bin.upcast::<gst::Element>()
++            };
++            let (video_filter, flip_video, crop_video) =
++                super::m52xq_flip_bin(&video_rate_bin, &self.m52xq_zoom);
++            camerabin.set_property("video-filter", &video_filter);
++            self.m52xq_flips.borrow_mut().push(flip_video.clone());
++            self.m52xq_video_flip.replace(Some(flip_video));
++            self.m52xq_crops.borrow_mut().push(crop_video);
++
++            // m52xq r125: I420 first for the PipeWire (BGRx) path - with NV12 first (r120) the restart after a 1080p
++            // recording failed to negotiate (zoom-videoscale "not negotiated") and the viewfinder stood ~25 s;
++            // NV12 first only while libcamerasrc gives NV12 (4K), see m52xq_set_video_caps
++            camerabin.set_property("video-capture-caps", super::m52xq_video_caps(false));
+ 
+             let videoconvert_image = gst::ElementFactory::make("videoconvert")
+                 .build()
+                 .expect("Missing GStreamer Base Plug-ins");
+-            camerabin.set_property("image-filter", &videoconvert_image);
++            let (image_filter, flip_image, crop_image) =
++                super::m52xq_flip_bin(&videoconvert_image, &self.m52xq_zoom);
++            camerabin.set_property("image-filter", &image_filter);
++            self.m52xq_flips.borrow_mut().push(flip_image);
++            self.m52xq_crops.borrow_mut().push(crop_image);
+ 
+             self.sink_paintable.set(paintablesink).unwrap();
+ 
+@@ -393,6 +786,8 @@ mod imp {
+             ));
+ 
+             obj.setup_recording();
++            obj.m52xq_watch_display();
++            obj.m52xq_setup_gestures();
+         }
+ 
+         fn dispose(&self) {
+@@ -446,15 +841,60 @@ mod imp {
+         }
+ 
+         fn snapshot(&self, snapshot: &gtk::Snapshot) {
++            let obj = self.obj();
++            let w = obj.width() as f32;
++            let h = obj.height() as f32;
++            // m52xq: pinch zoom around the middle (the image and video branches crop the same part)
++            let zoom = super::m52xq_zoom_value(&self.m52xq_zoom) as f32;
++            snapshot.push_clip(&graphene::Rect::new(0.0, 0.0, w, h));
++            snapshot.save();
++            if zoom > 1.001 {
++                snapshot.translate(&graphene::Point::new(w / 2.0, h / 2.0));
++                snapshot.scale(zoom, zoom);
++                snapshot.translate(&graphene::Point::new(-w / 2.0, -h / 2.0));
++            }
+             if self.is_front_camera.get() {
+-                let w = self.obj().width() as f32;
+-                snapshot.save();
+                 snapshot.translate(&graphene::Point::new(w, 0.0));
+                 snapshot.scale(-1.0, 1.0);
+-                self.parent_snapshot(snapshot);
+-                snapshot.restore();
+-            } else {
+-                self.parent_snapshot(snapshot);
++            }
++            self.parent_snapshot(snapshot);
++            snapshot.restore();
++            snapshot.pop();
++
++            // m52xq: focus square like the classic port (lomiri-camera-app m52xq-tap-focus): a thin white square
++            // with short ticks in the middle of every side and a dark thin outer edge; it shrinks from 1.4x onto the
++            // tapped point, stays while the lens searches and 1.2 s after, then fades out in 0.3 s
++            if let Some((x, y)) = self.m52xq_mark.get() {
++                let now = std::time::Instant::now();
++                let grow = self
++                    .m52xq_mark_start
++                    .get()
++                    .map(|start| (now.saturating_duration_since(start).as_secs_f32() / 0.15).min(1.0))
++                    .unwrap_or(1.0);
++                let scale = 1.4 - 0.4 * grow;
++                let alpha = match self.m52xq_mark_until.get() {
++                    Some(until) if now > until => {
++                        (1.0 - now.saturating_duration_since(until).as_secs_f32() / 0.3).max(0.0)
++                    }
++                    _ => 1.0,
++                };
++                let side = 54.0f32 * scale;
++                let rect = graphene::Rect::new(x - side / 2.0, y - side / 2.0, side, side);
++                let outer = graphene::Rect::new(rect.x() - 1.0, rect.y() - 1.0, side + 2.0, side + 2.0);
++                let dark = gdk::RGBA::new(0.0, 0.0, 0.0, 0.4 * alpha);
++                let white = gdk::RGBA::new(1.0, 1.0, 1.0, alpha);
++                snapshot.append_border(&gtk::gsk::RoundedRect::from_rect(outer, 0.0), &[1.0; 4], &[dark; 4]);
++                snapshot.append_border(&gtk::gsk::RoundedRect::from_rect(rect, 0.0), &[2.0; 4], &[white; 4]);
++                let tick = 7.0f32;
++                let (l, t, r, b) = (rect.x(), rect.y(), rect.x() + side, rect.y() + side);
++                for tick_rect in [
++                    graphene::Rect::new(x - 1.0, t, 2.0, tick),
++                    graphene::Rect::new(x - 1.0, b - tick, 2.0, tick),
++                    graphene::Rect::new(l, y - 1.0, tick, 2.0),
++                    graphene::Rect::new(r - tick, y - 1.0, tick, 2.0),
++                ] {
++                    snapshot.append_color(&white, &tick_rect);
++                }
+             }
+         }
+     }
+@@ -563,6 +1003,614 @@ impl Viewfinder {
+     ///
+     /// an aspect ratio calculated with width/height, or 0 for no valid aspect
+     /// ratio.
++    /// m52xq: follow the rotation of the display (Phosh implements org.gnome.Mutter.DisplayConfig; the
++    /// transform of the logical monitor is 0..3 = 0, 90, 180, 270 degrees) and turn the frames back by it.
++    fn m52xq_watch_display(&self) {
++        gio::DBusProxy::for_bus(
++            gio::BusType::Session,
++            gio::DBusProxyFlags::DO_NOT_AUTO_START,
++            None,
++            "org.gnome.Mutter.DisplayConfig",
++            "/org/gnome/Mutter/DisplayConfig",
++            "org.gnome.Mutter.DisplayConfig",
++            None::<&gio::Cancellable>,
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                move |res| {
++                    let proxy = match res {
++                        Ok(proxy) => proxy,
++                        Err(err) => {
++                            log::debug!("m52xq: no DisplayConfig: {err}");
++                            return;
++                        }
++                    };
++                    proxy.connect_local(
++                        "g-signal",
++                        false,
++                        glib::clone!(
++                            #[weak]
++                            obj,
++                            #[upgrade_or_default]
++                            move |args| {
++                                if args.get(2).and_then(|v| v.get::<String>().ok()).as_deref()
++                                    == Some("MonitorsChanged")
++                                {
++                                    obj.m52xq_update_transform();
++                                }
++                                None
++                            }
++                        ),
++                    );
++                    obj.imp().m52xq_display_proxy.replace(Some(proxy));
++                    obj.m52xq_update_transform();
++                }
++            ),
++        );
++    }
++
++    fn m52xq_update_transform(&self) {
++        let Some(proxy) = self.imp().m52xq_display_proxy.borrow().clone() else {
++            return;
++        };
++        proxy.call(
++            "GetCurrentState",
++            None,
++            gio::DBusCallFlags::NONE,
++            -1,
++            None::<&gio::Cancellable>,
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                move |res| {
++                    let Ok(state) = res else {
++                        return;
++                    };
++                    // (serial, monitors, logical_monitors a(iiduba(ssss)a{sv}), properties)
++                    let logical = state.child_value(2);
++                    if logical.n_children() == 0 {
++                        return;
++                    }
++                    let transform = logical.child_value(0).child_value(3).get::<u32>().unwrap_or(0) & 3;
++                    obj.imp().m52xq_display_transform.set(transform);
++                    // turn the camera frames back by the display rotation; M52XQ_SNAPSHOT_FLIP_DIR=1 swaps the
++                    // 90 degree directions (for testing on other devices)
++                    let invert = std::env::var("M52XQ_SNAPSHOT_FLIP_DIR").as_deref() == Ok("1");
++                    // checked on the M52 (2026-11-12): display transform 3 (landscape) needs 90l
++                    // m52xq (2026-11-13): the front camera (imx616, rotation 90) came out upside down while the back
++                    // ones (rotation 270) are upright -> turn the front frames by another 180 degrees;
++                    // M52XQ_SNAPSHOT_FRONT_180=0 switches this off
++                    let front = obj.imp().is_front_camera.get();
++                    // extra quarter turns of the front frames: M52XQ_SNAPSHOT_FRONT_STEPS=0..3 (default 2 = 180),
++                    // M52XQ_SNAPSHOT_FRONT_180=0 is the old switch for 0
++                    // m52xq (2026-11-16, checked on the M52): the front camera faces the user, so its frames turn the
++                    // other way round than the back ones (landscape: back 90l, front 90r), portrait needs no extra turn.
++                    // M52XQ_SNAPSHOT_FRONT_STEPS=0..3 adds quarter turns on top (default 0) for testing.
++                    let front_steps: u32 = std::env::var("M52XQ_SNAPSHOT_FRONT_STEPS")
++                        .ok()
++                        .and_then(|s| s.parse().ok())
++                        .unwrap_or(0);
++                    let base: u32 = match (transform, invert) {
++                        (1, false) | (3, true) => 1,
++                        (1, true) | (3, false) => 3,
++                        (2, _) => 2,
++                        _ => 0,
++                    };
++                    let steps = if front { (4 - base) % 4 + front_steps } else { base };
++                    let direction = match steps % 4 {
++                        1 => "90r",
++                        2 => "180",
++                        3 => "90l",
++                        _ => "identity",
++                    };
++                    log::info!("m52xq: display transform {transform}, front {front}, video-direction {direction}");
++                    /*
++                     * m52xq r104: the Venus encoder (v4l2h264enc) crashes its firmware on portrait-shaped frames
++                     * (1080x1920: Err_Fatal, "recovery failed to init HFI", only a reboot helps; 2026-11-17 and
++                     * pmOS Plasma 2026-10-22). A quarter turn of the RECORDING branch is therefore not done on the
++                     * frames: they stay landscape and the MP4 gets an orientation tag (players turn the video).
++                     */
++                    let video_flip = obj.imp().m52xq_video_flip.borrow().clone();
++                    /*
++                     * m52xq r107: the recorded frames are the raw sensor frames, not the viewfinder ones: checked on
++                     * the M52 (2026-11-17, frames pulled with ffmpeg -noautorotate) - main camera portrait (t = 0)
++                     * lies a quarter turn counter-clockwise, landscape (t = 3) is upright. The same formula as the
++                     * EXIF of the full-resolution photos: main 1 + t quarter turns clockwise, front 3 - t.
++                     */
++                    let t = transform as i32;
++                    let vsteps = if front { 3 - t } else { 1 + t }.rem_euclid(4);
++                    let video_direction = "identity";
++                    let orientation = match vsteps {
++                        1 => "rotate-90",
++                        2 => "rotate-180",
++                        3 => "rotate-270",
++                        _ => "rotate-0",
++                    };
++                    obj.imp().m52xq_video_orientation.set(orientation);
++                    for flip in obj.imp().m52xq_flips.borrow().iter() {
++                        if video_flip.as_ref() == Some(flip) {
++                            flip.set_property_from_str("video-direction", video_direction);
++                        } else {
++                            flip.set_property_from_str("video-direction", direction);
++                        }
++                    }
++                    // m52xq r108: the turned frame has other sides - crop the zoom for the new size at once
++                    if obj.imp().is_recording_video.borrow().is_none() {
++                        obj.m52xq_apply_crops();
++                    }
++                    log::info!("m52xq: recording frames {video_direction}, orientation tag {orientation}");
++                }
++            ),
++        );
++    }
++
++    fn m52xq_zoom(&self) -> f64 {
++        m52xq_zoom_value(&self.imp().m52xq_zoom)
++    }
++
++    fn m52xq_set_zoom(&self, zoom: f64) {
++        let zoom = zoom.clamp(1.0, 4.0);
++        self.imp()
++            .m52xq_zoom
++            .store(zoom.to_bits(), std::sync::atomic::Ordering::Relaxed);
++        self.queue_draw();
++    }
++
++    /// m52xq r110: the "4K Video" setting (Ubuntu Touch 003: 4K video size -> the viewfinder is 4K too, the source
++    /// cannot change its size on the fly)
++    pub fn m52xq_set_video_4k(&self, on: bool) {
++        self.imp().m52xq_video_4k.set(on);
++        self.m52xq_update_height();
++    }
++
++    /// m52xq r110: the camera page switched between the picture and the video mode
++    pub fn m52xq_set_video_mode(&self, on: bool) {
++        self.imp().m52xq_video_mode.set(on);
++        self.m52xq_update_height();
++    }
++
++    /// m52xq r110: 2160 in the video mode with the 4K setting, 1080 otherwise; a change re-applies the caps of the
++    /// camera and restarts a running stream through NULL (pipewiresrc negotiates the size only when it connects)
++    fn m52xq_update_height(&self) {
++        let imp = self.imp();
++        let want = if imp.m52xq_video_4k.get() && imp.m52xq_video_mode.get() { 2160 } else { 1080 };
++        let old = crate::utils::caps::M52XQ_WANTED_HEIGHT.swap(want, std::sync::atomic::Ordering::Relaxed);
++        if old == want || imp.is_recording_video.borrow().is_some() {
++            return;
++        }
++        log::info!("m52xq: viewfinder height {old} -> {want}");
++        /*
++         * m52xq r114: the 24 fps limit of 4K was set too late (on the CAPS event of the recording, the encoder had
++         * already negotiated 30/1): Venus got 4K30, lost timestamps (qtmux "Buffer has no PTS") and camerabin aborted
++         * (2026-11-17, r112/r113). Set it here, before the stream starts again in the new size.
++         */
++        if let Some(rate_caps) = imp.m52xq_rate_caps.get() {
++            let fps = if want >= 2160 { 24 } else { 30 };
++            rate_caps.set_property(
++                "caps",
++                gst::Caps::builder("video/x-raw")
++                    .field("framerate", gst::Fraction::new(fps, 1))
++                    .build(),
++            );
++            log::info!("m52xq: recording framerate {fps}");
++        }
++        let (Some(camera), Some(capsfilter)) = (self.camera(), imp.capsfilter.get()) else {
++            return;
++        };
++        let playing = imp.camerabin().current_state() == gst::State::Playing;
++        if playing {
++            self.stop_stream();
++        }
++        // m52xq r115: 4K from libcamerasrc directly (PipeWire stalled 4K: 300 ms gaps), the rest from PipeWire
++        let lc = want >= 2160 && std::env::var("M52XQ_4K_PIPEWIRE").as_deref() != Ok("1");
++        if !self.m52xq_swap_source(lc.then_some(&camera)) {
++            capsfilter.set_property("caps", camera.best_caps());
++        }
++        // m52xq r121: the encoding profile again, with the QP of the new size (4K: M52XQ_VENC_QP_4K)
++        self.setup_recording();
++        log::info!("m52xq: encoder QP {:?} for height {want}", m52xq_venc_qp());
++        if playing {
++            self.start_stream();
++        }
++    }
++
++    /// m52xq r115: the camera path for libcamerasrc ("/base/soc@0/cci@ac4a000/i2c-bus@0/camera@2d") from the
++    /// properties of the PipeWire camera (api.libcamera.path / object.path)
++    fn m52xq_libcamera_name(camera: &crate::Camera) -> Option<String> {
++        camera.properties().values().find_map(|value| {
++            let s = value.get::<String>().ok()?;
++            let i = s.find("/base/")?;
++            Some(s[i..].to_string())
++        })
++    }
++
++    /// m52xq r115: put libcamerasrc (Some(camera)) or the PipeWire source (None) in front of the capsfilter of
++    /// the camera bin; the pipeline must be in NULL. Returns true when libcamerasrc is in use afterwards.
++    fn m52xq_swap_source(&self, camera: Option<&crate::Camera>) -> bool {
++        let lc = self.m52xq_swap_source_inner(camera);
++        // m52xq r125: NV12 first only for libcamerasrc
++        self.imp()
++            .camerabin()
++            .set_property("video-capture-caps", m52xq_video_caps(lc));
++        lc
++    }
++
++    fn m52xq_swap_source_inner(&self, camera: Option<&crate::Camera>) -> bool {
++        let imp = self.imp();
++        let (Some(pw), Some(capsfilter)) = (imp.camera_element.get(), imp.capsfilter.get()) else {
++            return false;
++        };
++        let Some(bin) = capsfilter.parent().and_then(|p| p.downcast::<gst::Bin>().ok()) else {
++            return false;
++        };
++        let old_lc = imp.m52xq_lc_src.borrow_mut().take();
++        if let Some(lc) = &old_lc {
++            let _ = lc.set_state(gst::State::Null);
++            if let Some(tag) = imp.m52xq_lc_tag.borrow_mut().take() {
++                let _ = tag.set_state(gst::State::Null);
++                lc.unlink(&tag);
++                tag.unlink(capsfilter);
++                let _ = bin.remove(&tag);
++            } else {
++                lc.unlink(capsfilter);
++            }
++            let _ = bin.remove(lc);
++            if bin.add(pw).is_err() || pw.link(capsfilter).is_err() {
++                log::error!("m52xq: could not put the PipeWire source back");
++            }
++            log::info!("m52xq: camera source: PipeWire");
++            imp.m52xq_pw_retries.set(0);
++        }
++        let Some(camera) = camera else {
++            return false;
++        };
++        // m52xq r117: only cameras that have 3840x2160 (macro gc5035 is 2592x1944: libcamerasrc never negotiated)
++        let has_4k = camera.caps().is_some_and(|caps| {
++            caps.iter().any(|st| {
++                st.get::<i32>("width").is_ok_and(|w| w == 3840) && st.get::<i32>("height").is_ok_and(|h| h == 2160)
++            })
++        });
++        if !has_4k {
++            log::info!("m52xq: camera {:?} has no 3840x2160, stays on PipeWire", camera.display_name());
++            return false;
++        }
++        let Some(name) = Self::m52xq_libcamera_name(camera) else {
++            log::warn!("m52xq: no libcamera path in the camera properties, 4K stays on PipeWire");
++            return false;
++        };
++        let Ok(lc) = gst::ElementFactory::make("libcamerasrc")
++            .property("camera-name", &name)
++            .build()
++        else {
++            log::warn!("m52xq: no libcamerasrc (libcamera-gstreamer), 4K stays on PipeWire");
++            return false;
++        };
++        /*
++         * m52xq r116: PipeWire sends the sensor rotation as an image-orientation tag (main camera, rotation 270:
++         * rotate-90; front, rotation 90: rotate-270 - seen in the journal), gtk4paintablesink turns the viewfinder by
++         * it and the recording / photo code expects it. libcamerasrc sends no tag: the 4K viewfinder lay on its side
++         * in portrait and landscape (2026-11-18). taginject gives the same tag: rotate-(360 - rotation).
++         */
++        let rotation = camera
++            .properties()
++            .iter()
++            .find(|(k, _)| k.to_ascii_lowercase().ends_with("libcamera.rotation"))
++            .and_then(|(_, v)| v.get::<i32>().ok().or_else(|| v.get::<String>().ok()?.parse().ok()))
++            .unwrap_or(if camera.location() == crate::CameraLocation::Front { 90 } else { 270 });
++        let tag_value = format!("rotate-{}", (360 - rotation.rem_euclid(360)) % 360);
++        let tag = gst::ElementFactory::make("taginject")
++            .property("tags", format!("image-orientation=\"{tag_value}\""))
++            .build()
++            .ok();
++        let _ = pw.set_state(gst::State::Null);
++        pw.unlink(capsfilter);
++        let _ = bin.remove(pw);
++        let linked = match &tag {
++            Some(tag) => {
++                bin.add(&lc).is_ok()
++                    && bin.add(tag).is_ok()
++                    && lc.link(tag).is_ok()
++                    && tag.link(capsfilter).is_ok()
++            }
++            None => bin.add(&lc).is_ok() && lc.link(capsfilter).is_ok(),
++        };
++        if !linked {
++            log::error!("m52xq: could not link libcamerasrc, back to PipeWire");
++            let _ = bin.remove(&lc);
++            if let Some(tag) = &tag {
++                let _ = bin.remove(tag);
++            }
++            let _ = bin.add(pw);
++            let _ = pw.link(capsfilter);
++            return false;
++        }
++        // as m52xqcamsrc of 003: BGRx (other formats swapped red / blue); m52xq r116: 30 fps asked explicitly
++        // (libcamerasrc offered 10/1 and the 24 fps recording branch could not negotiate: an empty file)
++        // m52xq r118: one fixed framerate (a list / range was fixated by libcamerasrc to 10/1: empty recording); the
++        // front camera (imx616) gives at most 25 in 4K -> m52xq_lc_caps(n) steps 30, 25, 24, 20, 15 on failed starts
++        capsfilter.set_property("caps", m52xq_lc_caps(0));
++        log::info!("m52xq: libcamerasrc rotation {rotation}, tag {tag_value}");
++        imp.m52xq_lc_tag.replace(tag);
++        imp.m52xq_lc_retries.set(0);
++        imp.m52xq_lc_src.replace(Some(lc));
++        log::info!("m52xq: camera source: libcamerasrc {name}");
++        true
++    }
++
++    /// m52xq: crop the image and video branches by the current zoom (frame sizes already negotiated).
++    fn m52xq_apply_crops(&self) {
++        let zoom = self.m52xq_zoom();
++        for crop in self.imp().m52xq_crops.borrow().iter() {
++            if let Some((w, h)) = m52xq_crop_input_size(crop) {
++                m52xq_set_crop_size(crop, w, h, zoom);
++            } else if let Some(caps) = crop.static_pad("sink").and_then(|pad| pad.current_caps()) {
++                m52xq_set_crop(crop, &caps, zoom);
++            }
++        }
++    }
++
++    /// m52xq: pinch zoom, tap to focus (double tap: zoom 1x) and the autofocus timer. The camera controls of
++    /// Snapshot lie in a GtkOverlay over the viewfinder and get the touches, so the gestures go to that overlay
++    /// (capture phase, never claimed) once the viewfinder is mapped; taps on buttons are left alone.
++    fn m52xq_setup_gestures(&self) {
++        self.connect_map(|obj| {
++            let imp = obj.imp();
++            if imp.m52xq_gestures_attached.replace(true) {
++                return;
++            }
++            let target = obj
++                .ancestor(gtk::Overlay::static_type())
++                .unwrap_or_else(|| obj.clone().upcast());
++            obj.m52xq_attach_gestures(&target);
++        });
++
++        glib::timeout_add_local(
++            std::time::Duration::from_millis(30),
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                #[upgrade_or]
++                glib::ControlFlow::Break,
++                move || {
++                    obj.m52xq_af_tick();
++                    glib::ControlFlow::Continue
++                }
++            ),
++        );
++    }
++
++    /// m52xq: is (x, y) of `target` on a control (button, toggle, slider, the bottom bar) of the camera page?
++    fn m52xq_on_control(&self, target: &gtk::Widget, x: f64, y: f64) -> bool {
++        let mut widget = target.pick(x, y, gtk::PickFlags::DEFAULT);
++        while let Some(w) = widget {
++            if &w == target || w == *self.upcast_ref::<gtk::Widget>() {
++                return false;
++            }
++            let name = w.type_().name();
++            if w.is::<gtk::Button>()
++                || ["Toggle", "Scale", "Switch", "CameraControls", "Popover", "Entry", "Shutter"]
++                    .iter()
++                    .any(|n| name.contains(n))
++            {
++                return true;
++            }
++            widget = w.parent();
++        }
++        false
++    }
++
++    fn m52xq_attach_gestures(&self, target: &gtk::Widget) {
++        let zoom = gtk::GestureZoom::new();
++        zoom.set_propagation_phase(gtk::PropagationPhase::Capture);
++        zoom.connect_begin(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _| {
++                let imp = obj.imp();
++                imp.m52xq_zooming.set(true);
++                imp.m52xq_zoom_base.set(obj.m52xq_zoom());
++            }
++        ));
++        zoom.connect_scale_changed(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, scale| {
++                // the size of the video frames must not change during a recording
++                if obj.imp().is_recording_video.borrow().is_some() {
++                    return;
++                }
++                obj.m52xq_set_zoom(obj.imp().m52xq_zoom_base.get() * scale);
++            }
++        ));
++        zoom.connect_end(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _| {
++                let imp = obj.imp();
++                imp.m52xq_zooming.set(false);
++                imp.m52xq_zoom_end.set(Some(std::time::Instant::now()));
++                obj.m52xq_apply_crops();
++                log::info!("m52xq: viewfinder zoom {:.2}", obj.m52xq_zoom());
++            }
++        ));
++        zoom.connect_cancel(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _| {
++                obj.imp().m52xq_zooming.set(false);
++            }
++        ));
++        target.add_controller(zoom);
++
++        let click = gtk::GestureClick::new();
++        click.set_propagation_phase(gtk::PropagationPhase::Capture);
++        click.connect_released(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            #[weak]
++            target,
++            move |_, n_press, x, y| {
++                let imp = obj.imp();
++                if obj.m52xq_on_control(&target, x, y) {
++                    return;
++                }
++                // overlay coordinates -> viewfinder coordinates
++                let Some(point) =
++                    target.compute_point(&obj, &graphene::Point::new(x as f32, y as f32))
++                else {
++                    return;
++                };
++                let (x, y) = (point.x() as f64, point.y() as f64);
++                // a finger lifted after a pinch is no tap
++                if imp.m52xq_zooming.get()
++                    || imp
++                        .m52xq_zoom_end
++                        .get()
++                        .is_some_and(|end| end.elapsed().as_millis() < 400)
++                {
++                    return;
++                }
++                if n_press == 2 {
++                    if imp.is_recording_video.borrow().is_none() {
++                        obj.m52xq_set_zoom(1.0);
++                        obj.m52xq_apply_crops();
++                    }
++                    return;
++                }
++                obj.m52xq_focus_tap(x, y);
++            }
++        ));
++        target.add_controller(click);
++        log::info!("m52xq: zoom and tap to focus on {}", target.type_().name());
++    }
++
++    /// m52xq: tap at (x, y) of the widget: focus on that point of the frame.
++    fn m52xq_focus_tap(&self, x: f64, y: f64) {
++        let imp = self.imp();
++        if imp.is_taking_picture.get() {
++            log::info!("m52xq: tap ignored, taking a picture");
++            return;
++        }
++        let w = self.width() as f64;
++        let h = self.height() as f64;
++        let aspect = self.aspect_ratio();
++        if w <= 0.0 || h <= 0.0 || aspect <= 0.0 {
++            return;
++        }
++        // undo the zoom around the middle, then the "contain" fit of the picture
++        let zoom = self.m52xq_zoom();
++        let px = w / 2.0 + (x - w / 2.0) / zoom;
++        let py = h / 2.0 + (y - h / 2.0) / zoom;
++        let (dw, dh) = if w / h > aspect {
++            (h * aspect, h)
++        } else {
++            (w, w / aspect)
++        };
++        let u = (px - (w - dw) / 2.0) / dw;
++        let v = (py - (h - dh) / 2.0) / dh;
++        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
++            log::info!("m52xq: tap at {x:.0},{y:.0} is outside the picture ({u:.2} {v:.2})");
++            return;
++        }
++        // the lens moves only on the main camera; on the others the tap shows nothing (user 2026-11-16)
++        let available = imp.m52xq_af.borrow().available();
++        log::info!("m52xq: tap at {u:.2} {v:.2}, autofocus {}", if available { "on" } else { "not available" });
++        if !available {
++            return;
++        }
++        imp.m52xq_af.borrow_mut().focus_at(u, v);
++        imp.m52xq_mark.set(Some((x as f32, y as f32)));
++        imp.m52xq_mark_start.set(Some(std::time::Instant::now()));
++        imp.m52xq_mark_until.set(None);
++        self.queue_draw();
++    }
++
++    /// m52xq: feed the newest viewfinder frame to the autofocus, hide the focus mark 1.5 s after the lock.
++    fn m52xq_af_tick(&self) {
++        let imp = self.imp();
++        let Some(sink) = imp.m52xq_af_sink.get() else {
++            return;
++        };
++        let sample = sink.emit_by_name::<Option<gst::Sample>>("try-pull-sample", &[&0u64]);
++        if let Some(sample) = sample
++            && imp.m52xq_af.borrow().available()
++            && let (Some(buffer), Some(caps)) = (sample.buffer(), sample.caps())
++            && let Ok(info) = gst_video::VideoInfo::from_caps(caps)
++        {
++            let finfo = info.format_info();
++            // m52xq r100: like the classic port, the GREEN channel of RGB frames (component 1; component 0 of BGRx
++            // is red, the noisiest in the dark); the luma (component 0) of YUV frames
++            let comp = if finfo.is_rgb() && finfo.n_components() >= 3 { 1 } else { 0 };
++            let plane = finfo.plane()[comp] as usize;
++            let depth_ok = finfo.depth()[comp] == 8;
++            let pstride = finfo.pixel_stride()[comp];
++            let offset = finfo.poffset()[comp] as usize;
++            if depth_ok
++                && pstride > 0
++                && let Ok(frame) = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info)
++                && let Ok(data) = frame.plane_data(plane as u32)
++            {
++                let stride = frame.plane_stride()[plane];
++                if stride > 0 {
++                    let changed = imp.m52xq_af.borrow_mut().process_frame(
++                        data,
++                        stride as usize,
++                        pstride as usize,
++                        offset,
++                        info.width() as usize,
++                        info.height() as usize,
++                    );
++                    if changed {
++                        self.queue_draw();
++                    }
++                }
++            }
++        }
++
++        // m52xq r98: a picture waiting for the lens: take it 150 ms after the lock (lens settled) or at the deadline
++        let pending = imp.m52xq_pending_capture.borrow().clone();
++        if let Some((path, deadline, locked)) = pending {
++            let now = std::time::Instant::now();
++            let searching = imp.m52xq_af.borrow().is_searching();
++            let go = if !searching {
++                match locked {
++                    None => {
++                        imp.m52xq_pending_capture.replace(Some((path.clone(), deadline, Some(now))));
++                        false
++                    }
++                    Some(at) => now.saturating_duration_since(at).as_millis() >= 150,
++                }
++            } else {
++                now >= deadline
++            };
++            if go {
++                imp.m52xq_pending_capture.replace(None);
++                log::info!("m52xq: autofocus {}, taking the picture", if searching { "timed out" } else { "locked" });
++                self.m52xq_start_capture(&path);
++            }
++        }
++
++        if imp.m52xq_mark.get().is_some() {
++            // redraw for the shrink and the fade of the square
++            self.queue_draw();
++            if !imp.m52xq_af.borrow().is_searching() {
++                match imp.m52xq_mark_until.get() {
++                    None => imp
++                        .m52xq_mark_until
++                        .set(Some(std::time::Instant::now() + std::time::Duration::from_millis(1200))),
++                    Some(until)
++                        if std::time::Instant::now() >= until + std::time::Duration::from_millis(300) =>
++                    {
++                        imp.m52xq_mark.set(None);
++                        imp.m52xq_mark_until.set(None);
++                        imp.m52xq_mark_start.set(None);
++                    }
++                    _ => (),
++                }
++            }
++        }
++    }
++
+     pub fn aspect_ratio(&self) -> f64 {
+         let imp = self.imp();
+         if let Some(paintable) = imp.picture.paintable() {
+@@ -605,14 +1653,172 @@ impl Viewfinder {
+         // Set after we cannot fail anymore.
+         imp.is_taking_picture.set(true);
+ 
++        // m52xq r98: while the lens still searches, wait for the lock (at most 2.5 s, then the best position so far)
++        if imp.m52xq_af.borrow().is_searching() {
++            log::info!("m52xq: picture waits for the autofocus");
++            imp.m52xq_pending_capture.replace(Some((
++                location.as_ref().to_owned(),
++                std::time::Instant::now() + std::time::Duration::from_millis(2500),
++                None,
++            )));
++            return Ok(());
++        }
++        self.m52xq_start_capture(location.as_ref());
++        Ok(())
++    }
++
++    /// m52xq r98: the capture itself (after the autofocus is locked)
++    fn m52xq_start_capture(&self, location: &Path) {
++        let imp = self.imp();
++        // m52xq: stop a running focus search at its best position, crop by the zoom
++        imp.m52xq_af.borrow_mut().capture_started();
++        if self.m52xq_fullres_capture(location) {
++            return;
++        }
++        self.m52xq_apply_crops();
++
+         self.set_tags();
+ 
+         let camerabin = imp.camerabin();
+         camerabin.set_property_from_str("mode", "mode-image");
+-        camerabin.set_property("location", location.as_ref().display().to_string());
++        camerabin.set_property("location", location.display().to_string());
+         camerabin.emit_by_name::<()>("start-capture", &[]);
++    }
+ 
+-        Ok(())
++    /// m52xq: full-resolution photo (main camera 9248x6936 = 64 MP, front 6528x4896 = 32 MP) with the helper
++    /// m52xq-rawphoto (raw capture through libcamera + GPU development, port of the m52xq plasma-camera r36):
++    /// the viewfinder is stopped (the sensor keeps the exposure and gain of the auto exposure), the helper takes and
++    /// develops the frame, then the viewfinder starts again. Only at zoom 1x; M52XQ_FULLRES=0 switches it off.
++    /// Returns false when the normal capture should be used.
++    fn m52xq_fullres_capture(&self, location: &Path) -> bool {
++        const HELPER: &str = "/usr/bin/m52xq-rawphoto";
++        let imp = self.imp();
++        if std::env::var("M52XQ_FULLRES").as_deref() == Ok("0") || !Path::new(HELPER).exists() {
++            return false;
++        }
++        if self.m52xq_zoom() > 1.01 {
++            log::info!("m52xq: zoom {:.2}, normal photo", self.m52xq_zoom());
++            return false;
++        }
++        let front = imp.is_front_camera.get();
++        let main = imp.m52xq_af.borrow().available();
++        if !front && !main {
++            return false;
++        }
++        // EXIF orientation, checked on the M52 (2026-11-16) in portrait (t = display transform 0) and landscape (t = 3):
++        // main camera 1 + t quarter turns clockwise (portrait EXIF 6, landscape EXIF 1), front camera 3 - t (portrait
++        // EXIF 8, landscape EXIF 1) - the two turn the opposite way, as in the viewfinder.
++        // M52XQ_FULLRES_TURN adds quarter turns, M52XQ_FULLRES_DIR=-1 swaps the direction of the display part (tuning)
++        let t = imp.m52xq_display_transform.get() as i32;
++        let dir: i32 = std::env::var("M52XQ_FULLRES_DIR").ok().and_then(|s| s.parse().ok()).unwrap_or(1);
++        let extra: i32 = std::env::var("M52XQ_FULLRES_TURN").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
++        let steps = if front { 3 - dir * t + extra } else { 1 + dir * t + extra }.rem_euclid(4);
++        let exif = match steps {
++            1 => 6,
++            2 => 3,
++            3 => 8,
++            _ => 1,
++        };
++        log::info!(
++            "m52xq: full-resolution {} photo, display transform {t}, turn {steps}, EXIF {exif}: {}",
++            if front { "front" } else { "main" },
++            location.display()
++        );
++        let argv: Vec<std::ffi::OsString> = vec![
++            HELPER.into(),
++            "--camera".into(),
++            if front { "front" } else { "main" }.into(),
++            "--out".into(),
++            location.as_os_str().to_owned(),
++            "--orientation".into(),
++            exif.to_string().into(),
++        ];
++        let argv_ref: Vec<&std::ffi::OsStr> = argv.iter().map(|s| s.as_os_str()).collect();
++        // m52xq r103: a still of the last viewfinder frame instead of the black picture while the camera is busy
++        if let Some(live) = imp.picture.paintable() {
++            let still = live.current_image();
++            imp.picture.set_paintable(Some(&still));
++            imp.m52xq_live_paintable.replace(Some(live));
++        }
++        self.stop_stream();
++        let process = match gio::Subprocess::newv(&argv_ref, gio::SubprocessFlags::STDOUT_PIPE) {
++            Ok(process) => process,
++            Err(err) => {
++                log::warn!("m52xq: cannot run {HELPER}: {err}, normal photo");
++                self.m52xq_resume_viewfinder(false);
++                return false;
++            }
++        };
++        let path = location.to_owned();
++        let started = std::time::Instant::now();
++        // m52xq r103: the helper prints M52XQ_CAPTURED once the frame is read out: the viewfinder starts again at once
++        // while the frame is developed (before, the viewfinder waited for the whole development)
++        if let Some(out) = process.stdout_pipe() {
++            let lines = gio::DataInputStream::new(&out);
++            lines.read_line_utf8_async(
++                glib::Priority::DEFAULT,
++                None::<&gio::Cancellable>,
++                glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move |res| {
++                        if let Ok(Some(line)) = res
++                            && line.trim() == "M52XQ_CAPTURED"
++                        {
++                            log::info!("m52xq: frame read out after {} ms, viewfinder again", started.elapsed().as_millis());
++                            obj.m52xq_resume_viewfinder(true);
++                        }
++                    }
++                ),
++            );
++        }
++        process.wait_check_async(
++            None::<&gio::Cancellable>,
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                move |res| {
++                    let ok = res.is_ok() && path.exists();
++                    log::info!(
++                        "m52xq: full-resolution photo {} in {} ms",
++                        if ok { "saved" } else { "FAILED" },
++                        started.elapsed().as_millis()
++                    );
++                    obj.m52xq_resume_viewfinder(false);
++                    obj.imp().is_taking_picture.set(false);
++                    if ok {
++                        obj.emit_picture_done(Some(&gio::File::for_path(&path)));
++                    } else {
++                        obj.emit_picture_done(None);
++                    }
++                }
++            ),
++        );
++        true
++    }
++
++    /// m52xq r103: start the viewfinder again after a full-resolution photo (once), show the live picture again
++    /// 0.7 s later (the first frames of the restarted stream) or at once when the stream could not be stopped
++    fn m52xq_resume_viewfinder(&self, delayed: bool) {
++        let imp = self.imp();
++        let Some(live) = imp.m52xq_live_paintable.take() else {
++            return;
++        };
++        self.start_stream();
++        if !delayed {
++            imp.picture.set_paintable(Some(&live));
++            return;
++        }
++        glib::timeout_add_local_once(
++            std::time::Duration::from_millis(700),
++            glib::clone!(
++                #[weak(rename_to = obj)]
++                self,
++                move || {
++                    obj.imp().picture.set_paintable(Some(&live));
++                }
++            ),
++        );
+     }
+ 
+     /// Starts recording a video.
+@@ -646,6 +1852,9 @@ impl Viewfinder {
+             self.notify_is_recording();
+         };
+ 
++        // m52xq: crop by the zoom (locked during the recording)
++        self.m52xq_apply_crops();
++
+         let camerabin = imp.camerabin();
+         camerabin.set_property_from_str("mode", "mode-video");
+         camerabin.set_property("location", location.as_ref().display().to_string());
+@@ -716,6 +1925,19 @@ impl Viewfinder {
+ 
+     /// Starts the viewfinder.
+     pub fn start_stream(&self) {
++        /*
++         * m52xq r125: camerabin opens its video filesink on every "ready-for-capture = FALSE" of the source in the video
++         * mode, with the location it still has - our stream restarts (after a recording, source swaps) did that without a
++         * recording: the last video was opened again and TRUNCATED to 0 bytes (2026-11-18 02:56), and with no location yet
++         * the file sinks failed ("No file name specified", "Invalid location") and the viewfinder stayed black (15:39).
++         * Outside a capture the location is /dev/null; start_recording / taking a picture set the real one.
++         */
++        {
++            let imp = self.imp();
++            if imp.is_recording_video.borrow().is_none() && !imp.is_taking_picture.get() {
++                imp.camerabin().set_property("location", "/dev/null");
++            }
++        }
+         glib::spawn_future_local(glib::clone!(
+             #[weak(rename_to = obj)]
+             self,
+@@ -800,6 +2022,20 @@ impl Viewfinder {
+     fn on_bus_message(&self, msg: &gst::Message) {
+         match msg.view() {
+             gst::MessageView::Error(msg) => self.on_pipeline_error(msg),
++            /*
++             * m52xq r127: a failed start ("Could not start camerabin") leaves the viewfinder in ERROR; our retries
++             * (libcamerasrc / PipeWire) then start the camera, but the state stayed ERROR and recording was refused
++             * ("The viewfinder is not in the READY state", front 4K 2026-11-18 18:19: first acquire "already in
++             * use", retry 1 streamed). The camera bin reaching PLAYING means the viewfinder works again.
++             */
++            gst::MessageView::StateChanged(sc)
++                if sc.current() == gst::State::Playing
++                    && sc.src().is_some_and(|src| src == self.imp().camerabin().upcast_ref::<gst::Object>())
++                    && matches!(self.state(), ViewfinderState::Error) =>
++            {
++                log::info!("m52xq: camera bin playing again, viewfinder ERROR -> READY");
++                self.imp().set_state(ViewfinderState::Ready);
++            }
+             gst::MessageView::Element(msg) => match msg.structure() {
+                 Some(s) if s.has_name("image-done") => {
+                     let path = s.get::<PathBuf>("filename").unwrap();
+@@ -834,6 +2070,15 @@ impl Viewfinder {
+             let file = gio::File::for_path(path);
+             self.emit_recording_done(Some(&file));
+         }
++        // m52xq r106 (2026-11-17): camerabin leaves the encoder in READY between recordings, the V4L2 device stays open and
++        // the Venus encoder cannot start a second session on it (2nd recording stuck at the 1st frame, "session error 1004";
++        // reproduced with a plain pipeline READY -> PLAYING, NULL -> PLAYING works). With the hardware encoder: restart the
++        // whole pipeline through NULL after every recording.
++        if self.enable_hw_encoding() {
++            log::info!("m52xq: recording done, restarting the pipeline through NULL (Venus encoder)");
++            self.stop_stream();
++            self.start_stream();
++        }
+     }
+ 
+     fn on_pipeline_error(&self, err: &gst::message::Error) {
+@@ -846,6 +2091,84 @@ impl Viewfinder {
+ 
+         self.cancel_current_operation();
+ 
++        /*
++         * m52xq r115: PipeWire keeps the camera a few seconds after its stream stopped (until wireplumber suspends
++         * the node): libcamerasrc fails to acquire it -> try again every 0.5 s, up to 8 s.
++         */
++        let imp = self.imp();
++        // m52xq r119: retries only for errors of the camera source (an encoder error is no reason to restart the camera)
++        let from_source = err
++            .src()
++            .map(|s| s.path_string())
++            .is_some_and(|p| p.contains("wrappercamerabinsrc"));
++        if from_source && imp.m52xq_lc_src.borrow().is_some() && imp.m52xq_lc_retries.get() < 16 {
++            let n = imp.m52xq_lc_retries.get() + 1;
++            imp.m52xq_lc_retries.set(n);
++            log::info!("m52xq: libcamerasrc start failed, retry {n}");
++            self.stop_stream();
++            // m52xq r118: the next framerate (the camera may be busy too: every rate comes again after 5 tries)
++            if let Some(capsfilter) = imp.capsfilter.get() {
++                capsfilter.set_property("caps", m52xq_lc_caps(n));
++            }
++            glib::timeout_add_local_once(
++                std::time::Duration::from_millis(500),
++                glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move || {
++                        if obj.imp().m52xq_lc_src.borrow().is_some() {
++                            obj.start_stream();
++                        }
++                    }
++                ),
++            );
++            return;
++        }
++
++        /*
++         * m52xq r125: the PipeWire source failed (2026-11-18 16:07:57: Macro right after the 4K libcamerasrc of the main
++         * camera - wireplumber "Failed to setup link 'msm_csiphy3' -> 'msm_csid0': Resource busy", format negotiation
++         * failed, the viewfinder stayed black with "Could not play camera stream"): the CSID is freed a moment later ->
++         * try again every 0.5 s, up to 5 s.
++         */
++        // one failed start gives two bus errors (negotiation + data stream): one retry for both
++        if from_source && imp.m52xq_lc_src.borrow().is_none() && imp.m52xq_pw_retry_pending.get() {
++            return;
++        }
++        if from_source && imp.m52xq_lc_src.borrow().is_none() && imp.m52xq_pw_retries.get() < 10 {
++            imp.m52xq_pw_retry_pending.set(true);
++            let n = imp.m52xq_pw_retries.get() + 1;
++            imp.m52xq_pw_retries.set(n);
++            log::info!("m52xq: PipeWire camera start failed, retry {n}");
++            self.stop_stream();
++            glib::timeout_add_local_once(
++                std::time::Duration::from_millis(500),
++                glib::clone!(
++                    #[weak(rename_to = obj)]
++                    self,
++                    move || {
++                        obj.imp().m52xq_pw_retry_pending.set(false);
++                        if obj.imp().m52xq_lc_src.borrow().is_none() {
++                            obj.start_stream();
++                        }
++                    }
++                ),
++            );
++            return;
++        }
++
++        // m52xq r117: libcamerasrc never started (16 tries) -> back to PipeWire instead of a black viewfinder
++        if from_source && imp.m52xq_lc_src.borrow().is_some() {
++            log::warn!("m52xq: libcamerasrc did not start, back to PipeWire");
++            self.stop_stream();
++            self.m52xq_swap_source(None);
++            if let (Some(camera), Some(capsfilter)) = (self.camera(), imp.capsfilter.get()) {
++                capsfilter.set_property("caps", camera.best_caps());
++            }
++            self.start_stream();
++            return;
++        }
++
+         if self.imp().camerabin().current_state() != gst::State::Playing {
+             self.imp().set_state(ViewfinderState::Error);
+         }
+@@ -892,6 +2215,14 @@ impl Viewfinder {
+         if let Some(datetime) = gst::DateTime::new_now_local_time() {
+             tagsetter.add_tag::<gst::tags::DateTime>(&datetime, gst::TagMergeMode::Replace);
+         }
++        // m52xq r104: orientation of the recording (the frames are not turned by a quarter, see above)
++        tagsetter.add_tag::<gst::tags::ImageOrientation>(
++            &match imp.m52xq_video_orientation.get() {
++                "" => "rotate-0",
++                o => o,
++            },
++            gst::TagMergeMode::Replace,
++        );
+         if let Some(camera) = self.camera() {
+             let device_model = camera.display_name();
+             tagsetter.add_tag::<gst::tags::DeviceModel>(
+@@ -934,6 +2265,22 @@ impl Viewfinder {
+                     .field("bitrate", DEFAULT_BITRATE)
+                     .build(),
+             )
++            .item(
++                // m52xq r104: the settings of the classic port for Venus (Baseline, level 5.1, fixed QP 33/35 ~40 Mbit/s
++                // in 4K); the defaults (High profile, rate control) crashed the firmware at >= 1080p
++                ElementPropertiesMapItem::builder("v4l2h264enc")
++                    .field(
++                        "extra-controls",
++                        gst::Structure::builder("controls")
++                            .field("h264_profile", 0i32)
++                            .field("h264_level", 15i32)
++                            .field("frame_level_rate_control_enable", 0i32)
++                            .field("h264_i_frame_qp_value", m52xq_venc_qp().0)
++                            .field("h264_p_frame_qp_value", m52xq_venc_qp().1)
++                            .build(),
++                    )
++                    .build(),
++            )
+             .item(
+                 ElementPropertiesMapItem::builder("vulkanh264enc")
+                     .field("bitrate", DEFAULT_BITRATE)
+@@ -1201,6 +2548,14 @@ impl Viewfinder {
+     fn setup_camera_element(&self, camera: &crate::Camera) -> Result<(), glib::BoolError> {
+         let imp = self.imp();
+ 
++        // m52xq r115: another camera while libcamerasrc (4K) is in use: back to PipeWire, libcamerasrc again below
++        imp.m52xq_pw_retries.set(0);
++        let lc_was = imp.m52xq_lc_src.borrow().is_some();
++        if lc_was {
++            self.stop_stream();
++            self.m52xq_swap_source(None);
++        }
++
+         if let Some(element) = imp.camera_element.get() {
+             camera.reconfigure(element)?;
+         } else {
+@@ -1216,9 +2571,44 @@ impl Viewfinder {
+             let caps = camera.best_caps();
+             capsfilter.set_property("caps", &caps);
+         }
++        let want_4k = crate::utils::caps::M52XQ_WANTED_HEIGHT.load(std::sync::atomic::Ordering::Relaxed) >= 2160
++            && std::env::var("M52XQ_4K_PIPEWIRE").as_deref() != Ok("1");
++        if lc_was || want_4k {
++            self.m52xq_swap_source(want_4k.then_some(camera));
++            // m52xq r122: the encoding profile with the QP of this size (r121 missed this path: Snapshot opened in 4K kept 38/40)
++            self.setup_recording();
++            log::info!("m52xq: encoder QP {:?} (camera set, 4K {want_4k})", m52xq_venc_qp());
++        }
++        if lc_was {
++            self.start_stream();
++        }
+ 
+         let is_front_camera = !matches!(camera.location(), crate::CameraLocation::Back);
+         imp.is_front_camera.set(is_front_camera);
++        // m52xq: another camera starts without zoom; only the main camera (sensor camera@2d) has the lens,
++        // M52XQ_AF_CAMERA overrides the match
++        self.m52xq_set_zoom(1.0);
++        self.m52xq_apply_crops();
++        let af_match =
++            std::env::var("M52XQ_AF_CAMERA").unwrap_or_else(|_| "camera@2d".to_string());
++        let is_lens_camera = camera
++            .properties()
++            .values()
++            .any(|value| value.get::<String>().is_ok_and(|s| s.contains(&af_match)));
++        log::info!(
++            "m52xq: camera {:?} ({:?}), location {:?}, front {is_front_camera}, lens camera {is_lens_camera} (match {af_match:?})",
++            camera.display_name(),
++            camera
++                .properties()
++                .get("object.path")
++                .and_then(|v| v.get::<String>().ok()),
++            camera.location(),
++        );
++        imp.m52xq_af.borrow_mut().set_camera(is_lens_camera);
++        log::info!("m52xq: autofocus available: {}", imp.m52xq_af.borrow().available());
++        imp.m52xq_mark.set(None);
++        // m52xq: the front sensor is mounted the other way round (rotation 90, the back ones 270): recompute the turn
++        self.m52xq_update_transform();
+ 
+         Ok(())
+     }
+diff --git a/data/org.gnome.Snapshot.gschema.xml.in b/data/org.gnome.Snapshot.gschema.xml.in
+index 21d605f..6dfa22c 100644
+--- a/data/org.gnome.Snapshot.gschema.xml.in
++++ b/data/org.gnome.Snapshot.gschema.xml.in
+@@ -40,10 +40,17 @@
+       <description>Whether to record audio when recording video</description>
+     </key>
+     <key name="enable-hardware-encoding" type="b">
+-      <default>false</default>
++      <!-- m52xq r104: Venus (v4l2h264enc) works with the settings of the classic port -->
++      <default>true</default>
+       <summary>Enable hardware recording</summary>
+       <description>Whether to record video using hardware encoding</description>
+     </key>
++    <key name="m52xq-video-4k" type="b">
++      <!-- m52xq r110: 4K video in the video mode (Ubuntu Touch 003) -->
++      <default>false</default>
++      <summary>4K video</summary>
++      <description>Record 3840x2160 video in the video mode; the viewfinder is 4K too</description>
++    </key>
+     <key name="countdown" type="i">
+       <default>0</default>
+       <summary>Countdown timer</summary>
+diff --git a/data/resources/ui/preferences_window.ui b/data/resources/ui/preferences_window.ui
+index b10ef3a..66bd3c7 100644
+--- a/data/resources/ui/preferences_window.ui
++++ b/data/resources/ui/preferences_window.ui
+@@ -48,6 +48,15 @@
+                 <property name="use-underline">True</property>
+               </object>
+             </child>
++            <child>
++              <object class="AdwSwitchRow">
++                <!-- m52xq r110: 4K video in the video mode, as Ubuntu Touch 003 (the viewfinder is 4K too and slow) -->
++                <property name="title">_4K Video</property>
++                <property name="subtitle">3840×2160, 24 fps, video mode only; the viewfinder is slower</property>
++                <property name="action-name">preferences-window.m52xq-video-4k</property>
++                <property name="use-underline">True</property>
++              </object>
++            </child>
+           </object>
+         </child>
+       </object>
+diff --git a/src/widgets/camera.rs b/src/widgets/camera.rs
+index 47b393e..4c2e961 100644
+--- a/src/widgets/camera.rs
++++ b/src/widgets/camera.rs
+@@ -110,6 +110,9 @@ mod imp {
+                 };
+                 self.obj()
+                     .set_detect_codes(matches!(capture_mode, CaptureMode::QrDetection));
++                // m52xq r110: 4K only in the video mode
++                self.viewfinder
++                    .m52xq_set_video_mode(matches!(capture_mode, CaptureMode::Video));
+ 
+                 self.obj().notify_capture_mode();
+             }
+@@ -311,6 +314,22 @@ mod imp {
+                 .get_only()
+                 .build();
+ 
++            // m52xq r110: 4K video (Ubuntu Touch 003): the setting and the capture mode go to the viewfinder
++            self.viewfinder
++                .m52xq_set_video_4k(self.settings().boolean("m52xq-video-4k"));
++            self.viewfinder
++                .m52xq_set_video_mode(matches!(obj.capture_mode(), CaptureMode::Video));
++            self.settings().connect_changed(
++                Some("m52xq-video-4k"),
++                glib::clone!(
++                    #[weak(rename_to = imp)]
++                    self,
++                    move |settings, key| {
++                        imp.viewfinder.m52xq_set_video_4k(settings.boolean(key));
++                    }
++                ),
++            );
++
+             obj.connect_current_breakpoint_notify(glib::clone!(
+                 #[weak(rename_to = obj)]
+                 self,
+diff --git a/src/widgets/camera_controls.rs b/src/widgets/camera_controls.rs
+index 45cba8f..9351f29 100644
+--- a/src/widgets/camera_controls.rs
++++ b/src/widgets/camera_controls.rs
+@@ -89,10 +89,15 @@ mod imp {
+                     gtk::Orientation::Horizontal => {
+                         obj.set_margin_start(12);
+                         obj.set_margin_end(12);
++                        // m52xq: portrait, controls at the bottom: the camera menu opens upwards
++                        obj.imp().camera_menu_button.set_direction(gtk::ArrowType::Up);
+                     }
+                     gtk::Orientation::Vertical => {
+                         obj.set_margin_top(12);
+                         obj.set_margin_bottom(12);
++                        // m52xq: landscape, controls in a column at the screen edge: upwards the menu did not fit and
++                        // was cut by the screen edge, open it to the side of the viewfinder
++                        obj.imp().camera_menu_button.set_direction(gtk::ArrowType::Left);
+                     }
+                     _ => todo!(),
+                 }
+diff --git a/src/widgets/gallery.rs b/src/widgets/gallery.rs
+index 1496c6b..c165012 100644
+--- a/src/widgets/gallery.rs
++++ b/src/widgets/gallery.rs
+@@ -151,6 +151,13 @@ mod imp {
+                     obj.action_set_enabled("gallery.previous", has_prev);
+                     obj.action_set_enabled("gallery.next", has_next);
+ 
++                    // m52xq: a picture that was zoomed in is shown whole again when it comes back
++                    if let Some(old) = obj.imp().current_item.borrow().as_ref()
++                        && let Some(picture) = old.downcast_ref::<crate::GalleryPicture>()
++                    {
++                        picture.m52xq_reset_zoom();
++                    }
++
+                     if let Some(old) = obj.imp().current_item.replace(sliding_view.current_page())
+                         && let Some(video) = old.downcast_ref::<crate::GalleryVideo>()
+                     {
+diff --git a/src/widgets/gallery_picture.rs b/src/widgets/gallery_picture.rs
+index b730ee6..049cf92 100644
+--- a/src/widgets/gallery_picture.rs
++++ b/src/widgets/gallery_picture.rs
+@@ -1,11 +1,12 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ use adw::prelude::*;
+ use adw::subclass::prelude::*;
+-use gtk::{gdk, gio, glib};
++use gtk::{gdk, gio, glib, graphene};
+ 
+ use crate::widgets::gallery_item::GalleryItemImpl;
+ 
+ mod imp {
++    use std::cell::Cell;
+     use std::cell::OnceCell;
+ 
+     use super::*;
+@@ -13,6 +14,12 @@ mod imp {
+     #[derive(Debug, Default)]
+     pub struct GalleryPicture {
+         pub picture: OnceCell<gtk::Picture>,
++        /// m52xq: pinch zoom (1..6) and pan of the picture: screen = pan + zoom * point
++        pub m52xq_zoom: Cell<f64>,
++        pub m52xq_zoom_base: Cell<f64>,
++        pub m52xq_pan: Cell<(f64, f64)>,
++        pub m52xq_pan_start: Cell<(f64, f64)>,
++        pub m52xq_zooming: Cell<bool>,
+     }
+ 
+     #[glib::object_subclass]
+@@ -22,8 +29,42 @@ mod imp {
+         type ParentType = crate::GalleryItem;
+     }
+ 
+-    impl ObjectImpl for GalleryPicture {}
+-    impl WidgetImpl for GalleryPicture {}
++    impl ObjectImpl for GalleryPicture {
++        fn constructed(&self) {
++            self.parent_constructed();
++            self.obj().m52xq_setup_zoom();
++        }
++    }
++
++    impl WidgetImpl for GalleryPicture {
++        fn snapshot(&self, snapshot: &gtk::Snapshot) {
++            let zoom = self.m52xq_zoom.get();
++            if zoom <= 1.001 {
++                self.parent_snapshot(snapshot);
++                return;
++            }
++            let obj = self.obj();
++            let (px, py) = self.m52xq_pan.get();
++            snapshot.push_clip(&graphene::Rect::new(
++                0.0,
++                0.0,
++                obj.width() as f32,
++                obj.height() as f32,
++            ));
++            snapshot.save();
++            snapshot.translate(&graphene::Point::new(px as f32, py as f32));
++            snapshot.scale(zoom as f32, zoom as f32);
++            self.parent_snapshot(snapshot);
++            snapshot.restore();
++            snapshot.pop();
++        }
++
++        fn size_allocate(&self, width: i32, height: i32, baseline: i32) {
++            self.parent_size_allocate(width, height, baseline);
++            // m52xq: a rotation changes the size: keep the pan inside the picture
++            self.obj().m52xq_clamp_pan();
++        }
++    }
+     impl BinImpl for GalleryPicture {}
+     impl GalleryItemImpl for GalleryPicture {}
+ }
+@@ -74,6 +115,137 @@ impl GalleryPicture {
+         Ok(())
+     }
+ 
++    fn m52xq_zoom(&self) -> f64 {
++        self.imp().m52xq_zoom.get().max(1.0)
++    }
++
++    /// m52xq: picture back to 1x, page swipe on again.
++    pub fn m52xq_reset_zoom(&self) {
++        let imp = self.imp();
++        if imp.m52xq_zoom.get() > 1.001 {
++            imp.m52xq_zoom.set(1.0);
++            imp.m52xq_pan.set((0.0, 0.0));
++            self.m52xq_update_swipe();
++            self.queue_draw();
++        }
++    }
++
++    fn m52xq_update_swipe(&self) {
++        if let Some(view) = self
++            .ancestor(crate::SlidingView::static_type())
++            .and_downcast::<crate::SlidingView>()
++        {
++            view.m52xq_set_swipe_enabled(self.m52xq_zoom() <= 1.001);
++        }
++    }
++
++    fn m52xq_clamp_pan(&self) {
++        let imp = self.imp();
++        let zoom = self.m52xq_zoom();
++        let w = self.width() as f64;
++        let h = self.height() as f64;
++        let (px, py) = imp.m52xq_pan.get();
++        imp.m52xq_pan.set((
++            px.clamp(w - zoom * w, 0.0),
++            py.clamp(h - zoom * h, 0.0),
++        ));
++    }
++
++    /// m52xq: zoom to `zoom` keeping the picture point under (fx, fy) in place.
++    fn m52xq_zoom_at(&self, zoom: f64, fx: f64, fy: f64) {
++        let imp = self.imp();
++        let old = self.m52xq_zoom();
++        let zoom = zoom.clamp(1.0, 6.0);
++        let (px, py) = imp.m52xq_pan.get();
++        let qx = (fx - px) / old;
++        let qy = (fy - py) / old;
++        imp.m52xq_zoom.set(zoom);
++        imp.m52xq_pan.set((fx - zoom * qx, fy - zoom * qy));
++        self.m52xq_clamp_pan();
++        self.m52xq_update_swipe();
++        self.queue_draw();
++    }
++
++    /// m52xq: pinch to zoom, drag to pan the zoomed picture, double tap: 1x <-> 2.5x.
++    fn m52xq_setup_zoom(&self) {
++        let zoom = gtk::GestureZoom::new();
++        zoom.connect_begin(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _| {
++                let imp = obj.imp();
++                imp.m52xq_zooming.set(true);
++                imp.m52xq_zoom_base.set(obj.m52xq_zoom());
++            }
++        ));
++        zoom.connect_scale_changed(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |gesture, scale| {
++                let (fx, fy) = gesture
++                    .bounding_box_center()
++                    .unwrap_or((obj.width() as f64 / 2.0, obj.height() as f64 / 2.0));
++                obj.m52xq_zoom_at(obj.imp().m52xq_zoom_base.get() * scale, fx, fy);
++            }
++        ));
++        zoom.connect_end(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _| {
++                let imp = obj.imp();
++                imp.m52xq_zooming.set(false);
++                if obj.m52xq_zoom() < 1.05 {
++                    obj.m52xq_reset_zoom();
++                }
++                // the drag starts again from the current pan
++                imp.m52xq_pan_start.set(imp.m52xq_pan.get());
++            }
++        ));
++        self.add_controller(zoom);
++
++        let drag = gtk::GestureDrag::new();
++        drag.connect_drag_begin(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, _, _| {
++                let imp = obj.imp();
++                imp.m52xq_pan_start.set(imp.m52xq_pan.get());
++            }
++        ));
++        drag.connect_drag_update(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, dx, dy| {
++                let imp = obj.imp();
++                if obj.m52xq_zoom() <= 1.001 || imp.m52xq_zooming.get() {
++                    return;
++                }
++                let (sx, sy) = imp.m52xq_pan_start.get();
++                imp.m52xq_pan.set((sx + dx, sy + dy));
++                obj.m52xq_clamp_pan();
++                obj.queue_draw();
++            }
++        ));
++        self.add_controller(drag);
++
++        let click = gtk::GestureClick::new();
++        click.connect_released(glib::clone!(
++            #[weak(rename_to = obj)]
++            self,
++            move |_, n_press, x, y| {
++                if n_press != 2 {
++                    return;
++                }
++                if obj.m52xq_zoom() > 1.001 {
++                    obj.m52xq_reset_zoom();
++                } else {
++                    obj.m52xq_zoom_at(2.5, x, y);
++                }
++            }
++        ));
++        self.add_controller(click);
++    }
++
+     // Ugh
+     fn file(&self) -> gio::File {
+         self.upcast_ref::<crate::GalleryItem>().file()
+diff --git a/src/widgets/preferences_window.rs b/src/widgets/preferences_window.rs
+index 8c28e22..e69640c 100644
+--- a/src/widgets/preferences_window.rs
++++ b/src/widgets/preferences_window.rs
+@@ -57,6 +57,9 @@ mod imp {
+                 action_group.add_action(&enable_audio_recording);
+                 let enable_hw_encoder = settings.create_action("enable-hardware-encoding");
+                 action_group.add_action(&enable_hw_encoder);
++                // m52xq r110: 4K video in the video mode (Ubuntu Touch 003)
++                let video_4k = settings.create_action("m52xq-video-4k");
++                action_group.add_action(&video_4k);
+             }
+ 
+             if aperture::is_h264_encoding_supported() {
+diff --git a/src/widgets/sliding_view.rs b/src/widgets/sliding_view.rs
+index e6fd3fa..c98784e 100644
+--- a/src/widgets/sliding_view.rs
++++ b/src/widgets/sliding_view.rs
+@@ -268,6 +268,13 @@ glib::wrapper! {
+ }
+ 
+ impl SlidingView {
++    /// m52xq: no page swipe while a picture is zoomed in (the finger pans the picture then)
++    pub fn m52xq_set_swipe_enabled(&self, enabled: bool) {
++        if let Some(tracker) = self.imp().swipe_tracker.get() {
++            tracker.set_enabled(enabled);
++        }
++    }
++
+     /// Add page to the end
+     pub fn append(&self, page: &crate::GalleryItem) {
+         self.insert(page, self.n_pages());

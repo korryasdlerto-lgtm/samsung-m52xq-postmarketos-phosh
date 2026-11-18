@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=M52XQ idle suspend
+Comment=Suspend the phone after the idle time of the power settings (gsd-power does not)
+Exec=/usr/bin/python3 -B /usr/local/bin/m52xq-idle-suspend
+NoDisplay=true
+X-GNOME-Autostart-Phase=Application

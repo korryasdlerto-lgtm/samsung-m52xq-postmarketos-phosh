@@ -1,0 +1,70 @@
+From: Asdlerto Korry <korryasdlerto@gmail.com>
+Subject: [PATCH] m52xq: calls: bring the call window to the front for a second call
+
+After "Add call" the main window (dial pad) is in front of the call window.
+A new call only made the already visible call window "visible", so it stayed
+behind and the connected second call had no controls. Present the call window
+when a second call is added and when a call becomes active while two calls
+exist, with that call focused.
+---
+--- a/src/calls-call-window.c
++++ b/src/calls-call-window.c
+@@ -165,12 +165,46 @@
+ }
+ 
+ 
++static void set_focus (CallsCallWindow *self, CuiCallDisplay *display);
++
++/* m52xq: the display of a call (NULL when the call is not in the window) */
++static CuiCallDisplay *
++m52xq_display_for_call (CallsCallWindow *self,
++                        CuiCall         *call)
++{
++  guint n = g_list_model_get_n_items (G_LIST_MODEL (self->calls));
++
++  for (guint i = 0; i < n; i++) {
++    g_autoptr (CallsCallSelectorItem) item = g_list_model_get_item (G_LIST_MODEL (self->calls), i);
++    CuiCallDisplay *display = calls_call_selector_item_get_display (item);
++
++    if (cui_call_display_get_call (display) == call)
++      return display;
++  }
++
++  return NULL;
++}
++
++
+ static void
+ on_call_state_changed_swap (CuiCall         *call,
+                             GParamSpec      *pspec,
+                             CallsCallWindow *self)
+ {
+   update_swap_button (self);
++
++  /* m52xq: a second call got connected while the main window (dial pad, opened by "Add call") was in front:
++   * the call window stayed behind it and the connected call had no controls (2026-11-18). Bring the call
++   * window to the front with the connected call. */
++  if (cui_call_get_state (call) == CUI_CALL_STATE_ACTIVE &&
++      g_list_model_get_n_items (G_LIST_MODEL (self->calls)) > 1) {
++    CuiCallDisplay *display = m52xq_display_for_call (self, call);
++
++    if (display) {
++      set_focus (self, display);
++      gtk_window_present (GTK_WINDOW (self));
++    }
++  }
+ }
+ 
+ 
+@@ -266,6 +300,11 @@
+ 
+   update_visibility (self);
+   set_focus (self, display);
++
++  /* m52xq: the window is already visible (behind the main window after "Add call"): becoming visible does not
++   * raise it for a second call, present it explicitly */
++  if (g_list_model_get_n_items (G_LIST_MODEL (self->calls)) > 1)
++    gtk_window_present (GTK_WINDOW (self));
+ }
+ 
+ 

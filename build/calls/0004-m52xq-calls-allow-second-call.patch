@@ -1,0 +1,17 @@
+--- a/plugins/provider/mm/calls-mm-origin.c	2026-11-12 15:08:11.481633837 +0200
++++ b/plugins/provider/mm/calls-mm-origin.c	2026-11-12 17:57:41.262504879 +0200
+@@ -336,9 +336,12 @@
+ 
+   g_assert (self->voice != NULL);
+ 
+-  /* FIXME: remove once add_call doesn't hang up secondary calls */
+-  if (g_hash_table_size (self->calls) >= 1)
++  /* m52xq: a second call (Add call) is allowed: one active + one held call is the normal GSM case (the second incoming call is
++   * still not accepted automatically, see the handling of inbound calls). A third call is refused. */
++  if (g_hash_table_size (self->calls) >= 2) {
++    g_warning ("Not dialing %s: this SIM already has two calls", number);
+     return;
++  }
+ 
+   call_props = mm_call_properties_new ();
+   mm_call_properties_set_number (call_props, number);

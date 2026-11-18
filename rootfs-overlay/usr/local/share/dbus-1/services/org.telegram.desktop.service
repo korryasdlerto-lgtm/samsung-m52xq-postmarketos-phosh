@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=org.telegram.desktop
+# m52xq (2026-11-17): GLib network monitor off — its "network changed" (wake-up from a dark wake: modem modes, BT, GPS given back)
+# made Telegram decline a ringing call at the moment of unlocking
+Exec=/usr/bin/env GIO_USE_NETWORK_MONITOR=base /usr/bin/Telegram

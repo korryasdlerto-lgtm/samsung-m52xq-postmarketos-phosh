@@ -1,0 +1,296 @@
+#!/usr/bin/python3
+# M52XQ (pmOS Phosh, v2 2026-11-14): virtual webcams for apps that only know V4L2 webcams (Telegram, browsers ...).
+# The phone cameras are raw sensors behind libcamera, so two v4l2loopback devices (/dev/video20 "Phone camera front",
+# /dev/video21 "Phone camera rear") are fed from libcamera. A loopback device gives EIO to readers while nothing feeds it,
+# so an idle device is fed with black frames; when an application reads a device its real camera is switched in.
+# v2: ONE writer per device for the whole lifetime (videotestsrc + camera branch -> input-selector -> v4l2sink). In v1 the
+# black gst-launch process was stopped and a camera process started: the reader saw a broken stream (EIO) and Telegram
+# Desktop aborted in tg_owt video_capture_v4l2.cc:418 (RTC_CHECK_RUNS_SERIALIZED) when it restarted the capture.
+#   orientation : /etc/m52xq-virtualcam.conf (key=value; videoflip methods per camera)
+import os
+import signal
+import subprocess
+import sys
+import time
+
+import gi
+gi.require_version('Gst', '1.0')
+from gi.repository import GLib, Gst
+
+DEVS = {'front': '/dev/video20', 'rear': '/dev/video21'}
+_SOC = 'soc@0' if os.path.isdir('/proc/device-tree/soc@0') else 'soc'
+CAM_ID = {'front': '/base/%s/cci@ac4b000/i2c-bus@0/camera@1a' % _SOC,	# imx616
+          'rear': '/base/%s/cci@ac4a000/i2c-bus@0/camera@2d' % _SOC}	# s5kgw3
+CONF = '/etc/m52xq-virtualcam.conf'
+SLEEP_FLAG = '/run/m52xq-camera-sleep'	# set by the sleep hook m52xq-camera-sleep.sh: no real camera while the system sleeps
+STATE = os.path.expanduser('~/.cache/m52xq-virtualcam-state')
+FORCE = os.path.expanduser('~/.config/m52xq-virtualcam-force')	# off | front | rear: keep that camera running without a reader
+W, H, FPS = 720, 960, 15	# fixed output (portrait); the loopback format must not change while a reader is streaming
+OUT_CAPS = 'video/x-raw,format=YUY2,width=%d,height=%d,framerate=%d/1' % (W, H, FPS)
+ANGLE = {'none': 0, 'clockwise': 90, 'rotate-180': 180, 'counterclockwise': 270}
+METHOD = {v: k for k, v in ANGLE.items()}
+ORIENT_ADD = {'normal': 0, 'right-up': 270, 'left-up': 90, 'bottom-up': 180}
+
+
+def log(msg):
+    print('m52xq-virtualcam: ' + msg, flush=True)
+
+
+def orientation():
+    try:
+        out = subprocess.run(['busctl', '--system', 'get-property', 'net.hadess.SensorProxy', '/net/hadess/SensorProxy',
+                              'net.hadess.SensorProxy', 'AccelerometerOrientation'],
+                             capture_output=True, text=True, timeout=2).stdout.split('"')
+        return out[1] if len(out) > 1 and out[1] in ORIENT_ADD else 'normal'
+    except (OSError, subprocess.SubprocessError):
+        return 'normal'
+
+
+def read_conf():
+    c = {'front_method': 'counterclockwise', 'rear_method': 'clockwise', 'front_mirror': '0', 'front_landscape_flip': '1'}
+    try:
+        for line in open(CONF):
+            line = line.strip()
+            if line and not line.startswith('#') and '=' in line:
+                k, v = line.split('=', 1)
+                c[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return c
+
+
+def read_force():
+    try:
+        v = open(FORCE).read().strip()
+        return v if v in ('front', 'rear') else 'off'
+    except OSError:
+        return 'off'
+
+
+def readers(dev):
+    """pids (not ours) that READ dev: they hold it open AND have its buffers mmap'ed (Telegram keeps many /dev/video* open
+    after enumerating them; those are not readers)."""
+    own = os.getpid()
+    res = []
+    for p in os.listdir('/proc'):
+        if not p.isdigit() or int(p) == own:
+            continue
+        try:
+            held = any(os.readlink('/proc/%s/fd/%s' % (p, fd)) == dev for fd in os.listdir('/proc/%s/fd' % p))
+            if held and dev in open('/proc/%s/maps' % p).read():
+                res.append(int(p))
+        except OSError:
+            continue
+    return res
+
+
+def camera_desc(cam, conf, orient):
+    method = conf['front_method'] if cam == 'front' else conf['rear_method']
+    landscape = False
+    if method in ANGLE and orient != 'normal':
+        angle = (ANGLE[method] + ORIENT_ADD.get(orient, 0)) % 360
+        if cam == 'front' and conf.get('front_landscape_flip') == '1':
+            angle = (angle + 180) % 360
+        method = METHOD[angle]
+        landscape = angle in (0, 180)
+    flip = 'videoflip method=%s ! ' % method if method not in ('', 'none') else ''
+    mirror = 'videoflip method=horizontal-flip ! ' if cam == 'front' and conf.get('front_mirror') == '1' else ''
+    if landscape:
+        size = ('videoscale ! capsfilter caps="video/x-raw,width=%d,height=%d" ! videobox top=%d bottom=%d ! videoconvert ! '
+                % (W, W * 3 // 4, -((H - W * 3 // 4) // 2), -((H - W * 3 // 4) // 2)))
+    else:
+        size = 'videoscale ! videoconvert ! '
+    return ('libcamerasrc camera-name="%s" ! capsfilter caps="video/x-raw,width=1280,height=960" ! %s%s%s'
+            'videorate ! capsfilter caps="%s"' % (CAM_ID[cam], flip, mirror, size, OUT_CAPS))
+
+
+class Device:
+    """One writer per device for the whole lifetime: appsrc (fixed caps) -> v4l2sink. Black frames are pushed by a timer
+    while the camera is off; the camera runs in its own pipeline ending in an appsink whose buffers are pushed into the
+    same appsrc. No caps event ever reaches v4l2loopback after the start (v2 with input-selector: the camera branch sent
+    slightly different caps, v4l2sink tried to set the format again while Telegram was reading: "Device is busy")."""
+
+    def __init__(self, cam):
+        self.cam, self.dev = cam, DEVS[cam]
+        self.pipe = Gst.parse_launch('appsrc name=src is-live=true format=time do-timestamp=true caps="%s" '
+                                     '! videoconvert ! capsfilter caps="%s,pixel-aspect-ratio=1/1,interlace-mode=progressive" '
+                                     '! queue max-size-buffers=2 leaky=downstream ! v4l2sink device=%s sync=false'
+                                     % (OUT_CAPS, OUT_CAPS, self.dev))
+        self.src = self.pipe.get_by_name('src')
+        self.black = Gst.Buffer.new_wrapped(bytes([16, 128]) * (W * H))	# YUY2 black: Y 16, U/V 128
+        self.camp = None	# camera pipeline
+        self.orient = 'normal'
+        self.failed_at = 0.0	# last failure of the camera: no restart for 5 s (no start/stop storm)
+        self.last_cam_buf = 0.0
+        self.has_reader = False	# set by the watch (tick)
+        bus = self.pipe.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self.on_error, False)
+        self.pipe.set_state(Gst.State.PLAYING)
+        GLib.timeout_add(1000 // FPS, self.push_black)
+
+    def push_black(self):
+        # black frames while the camera is off (and as a stopgap while it starts: no frame for 0.5 s); without a reader only
+        # one frame a second (less work for an idle phone), with a reader the full rate
+        self.tick_n = getattr(self, 'tick_n', 0) + 1
+        if self.camp is None or time.time() - self.last_cam_buf > 0.5:
+            if self.has_reader or self.tick_n % FPS == 0:
+                self.src.emit('push-buffer', self.black.copy())
+        return True
+
+    def on_sample(self, sink):
+        sample = sink.emit('pull-sample')
+        if sample is not None:
+            self.last_cam_buf = time.time()
+            buf = sample.get_buffer().copy()
+            buf.pts = buf.dts = Gst.CLOCK_TIME_NONE	# appsrc do-timestamp stamps it
+            self.src.emit('push-buffer', buf)
+        return Gst.FlowReturn.OK
+
+    def on_error(self, bus, msg, from_camera):
+        err, dbg = msg.parse_error()
+        src = msg.src.get_name() if msg.src else '?'
+        log('%s: error from %s%s: %s' % (self.cam, 'camera ' if from_camera else '', src, err.message))
+        if from_camera and self.camp is not None:
+            self.failed_at = time.time()
+            GLib.idle_add(self.stop_camera)
+
+    @property
+    def running(self):
+        return self.camp is not None
+
+    def start_camera(self, orient):
+        if self.camp is not None:
+            return
+        self.orient = orient
+        desc = camera_desc(self.cam, read_conf(), orient) + ' ! appsink name=out emit-signals=true max-buffers=1 drop=true sync=false'
+        try:
+            self.camp = Gst.parse_launch(desc)
+        except GLib.Error as e:
+            log('%s: camera pipeline %r: %s' % (self.cam, desc, e.message))
+            self.camp = None
+            return
+        self.camp.get_by_name('out').connect('new-sample', self.on_sample)
+        bus = self.camp.get_bus()
+        bus.add_signal_watch()
+        bus.connect('message::error', self.on_error, True)
+        self.camp.set_state(Gst.State.PLAYING)
+        log('%s: camera on (%s)' % (self.cam, orient))
+
+    def stop_camera(self):
+        if self.camp is None:
+            return False
+        camp, self.camp = self.camp, None
+        camp.get_bus().remove_signal_watch()
+        camp.set_state(Gst.State.NULL)
+        log('%s: camera off -> black' % self.cam)
+        return False
+
+    def shutdown(self):
+        self.stop_camera()
+        self.pipe.set_state(Gst.State.NULL)
+
+
+def write_state(devs):
+    cams = [c for c, d in devs.items() if d.running]
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        with open(STATE, 'w') as f:
+            f.write((cams[0] if cams else 'off') + '\n')
+    except OSError:
+        pass
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == 'status':
+        try:
+            print(open(STATE).read().strip() or 'off')
+        except OSError:
+            print('off')
+        return
+    if len(sys.argv) > 1 and sys.argv[1] == 'switch':
+        want = sys.argv[2] if len(sys.argv) > 2 else 'toggle'
+        new = {'off': 'front', 'front': 'rear', 'rear': 'off'}[read_force()] if want == 'toggle' else want
+        os.makedirs(os.path.dirname(FORCE), exist_ok=True)
+        open(FORCE, 'w').write(new + '\n')
+        print(new)
+        return
+    Gst.init(None)
+    for dev in DEVS.values():
+        while not os.path.exists(dev):
+            time.sleep(1)
+    devs = {c: Device(c) for c in DEVS}
+    write_state(devs)
+    st = {'since': {c: None for c in DEVS}, 'idle': {c: None for c in DEVS}, 'asleep': False,
+          'orient': 'normal', 'orient_poll': 0.0, 'orient_since': {c: None for c in DEVS}}
+    loop = GLib.MainLoop()
+
+    def tick():
+        try:
+            return tick_inner()
+        except Exception as e:	# a failing camera must not stop the watch (the GLib timer ends on an exception)
+            log('tick error: %s' % e)
+            return True
+
+    def tick_inner():
+        now = time.time()
+        if os.path.exists(SLEEP_FLAG):
+            if not st['asleep']:
+                st['asleep'] = True
+                for d in devs.values():
+                    if d.running:
+                        log('%s: system sleep -> black' % d.cam)
+                        d.stop_camera()
+                write_state(devs)
+            return True
+        if st['asleep']:
+            st['asleep'] = False
+            st['since'] = {c: None for c in DEVS}
+            st['idle'] = {c: None for c in DEVS}
+            log('resumed: cameras follow their readers again')
+        if now - st['orient_poll'] >= 1.0 and any(d.running for d in devs.values()):
+            st['orient_poll'] = now
+            st['orient'] = orientation()
+        for cam, d in devs.items():
+            if d.running and st['orient'] != d.orient:
+                st['orient_since'][cam] = st['orient_since'][cam] or now
+                if now - st['orient_since'][cam] >= 1.0:
+                    log('%s: orientation %s -> %s' % (cam, d.orient, st['orient']))
+                    d.stop_camera()
+                    d.start_camera(st['orient'])
+                    st['orient_since'][cam] = None
+                    continue
+            else:
+                st['orient_since'][cam] = None
+            r = readers(d.dev) or ([0] if read_force() == cam else [])
+            d.has_reader = bool(r)
+            if r:
+                st['idle'][cam] = None
+                st['since'][cam] = st['since'][cam] or now
+            else:
+                st['since'][cam] = None
+                st['idle'][cam] = st['idle'][cam] or now
+            if not d.running and r and now - st['since'][cam] > 1.5 and now - d.failed_at > 5.0:
+                other = devs['rear' if cam == 'front' else 'front']
+                if other.running:
+                    log('%s -> stop %s' % (cam, other.cam))
+                    other.stop_camera()
+                log('%s: reader %s -> start camera' % (cam, r))
+                d.start_camera(orientation())
+                write_state(devs)
+            elif d.running and not r and now - st['idle'][cam] > 4.0:
+                log('%s: no readers' % cam)
+                d.stop_camera()
+                write_state(devs)
+        return True
+
+    GLib.timeout_add(500, tick)
+    for s in (signal.SIGTERM, signal.SIGINT):
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, s, lambda: (loop.quit(), False)[1])
+    log('started: %s' % ', '.join('%s=%s' % (c, d) for c, d in DEVS.items()))
+    loop.run()
+    for d in devs.values():
+        d.shutdown()
+
+
+main()

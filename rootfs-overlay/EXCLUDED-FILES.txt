@@ -1,6 +1,39 @@
-Files put into the image but not stored in this repository (binaries):
-
-usr/lib/modules/7.1.13/  — 23 kernel modules of build #444 and the depmod files; list: ../kernel/modules-7.1.13-444.txt;
-                           files: modules tarball of release kernel-7.1.13 (samsung-m52xq-ubuntu-lomiri).
-
-No other overlay files yet.
+Files of the installer overlay that are NOT in this repository (path, size, md5).
+Binaries are built from build/ and kernel/ (patches and sources here) or are unmodified upstream builds;
+kernel modules (usr/lib/modules) belong to the kernel of this release (kernel/patches, kernel/config-7.1.13).
+usr/lib/libssc.so.2	133016	e21b1925bfeb1bf2c063150d233cf669
+usr/lib/m52xq/libssc.so.2	133016	e828fb6ca0fb2ddc1df5a7ac4a39c202
+usr/lib/modules/7.1.13/extra/v4l2loopback.ko	586288	517e5e37f820787f9e3aa2da9e7900d9
+usr/lib/modules/7.1.13/extra/venus/v4l2-mem2mem.ko	474656	a3eb093314989970a2dd0573af34f675
+usr/lib/modules/7.1.13/extra/venus/venus-core.ko	3492608	d6f9178dfbed52358a2716e2924040d0
+usr/lib/modules/7.1.13/extra/venus/venus-dec.ko	764560	0f21688c4819e1ff637e07355054193c
+usr/lib/modules/7.1.13/extra/venus/venus-enc.ko	772008	9116aedb506b165c2d9b35af4fc21cc7
+usr/lib/modules/7.1.13/extra/venus/videobuf2-dma-contig.ko	326688	5367cb66e7f0612ad2d1423b9e5d990c
+usr/lib/modules/7.1.13/kernel/drivers/gpu/drm/panel/panel-novatek-nt37701.ko	28416	afc0f2c7381006140795dee59482a50a
+usr/lib/modules/7.1.13/kernel/drivers/input/touchscreen/focaltech_touch/fts_tp.ko	234104	0f91f47d63120a6de05e9f07e551685a
+usr/lib/modules/7.1.13/kernel/drivers/input/touchscreen/focaltech_touch_ft3658u/focaltech_ts.ko	129808	6276538707c12d05514df858c22c61de
+usr/lib/modules/7.1.13/kernel/drivers/media/common/videobuf2/videobuf2-dma-contig.ko	21080	7b9e276cd582bc2cc708dcfdf3cbc9df
+usr/lib/modules/7.1.13/kernel/drivers/media/i2c/gc02m1b.ko	25800	e2593a846bd5236d3ec504b451ee6bc2
+usr/lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-core.ko	3492608	d6f9178dfbed52358a2716e2924040d0
+usr/lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-dec.ko	764560	0f21688c4819e1ff637e07355054193c
+usr/lib/modules/7.1.13/kernel/drivers/media/platform/qcom/venus/venus-enc.ko	772008	9116aedb506b165c2d9b35af4fc21cc7
+usr/lib/modules/7.1.13/kernel/drivers/media/v4l2-core/v4l2-mem2mem.ko	52400	1e5c3dc46a489e66ae5b078f4c9281ff
+usr/lib/modules/7.1.13/kernel/drivers/net/wireless/ath/ath11k/ath11k_ahb.ko	678776	ae2024a41de97e7e5337627d79e08d35
+usr/lib/modules/7.1.13/kernel/drivers/pci/pwrctrl/pci-pwrctrl-tc9563.ko	15912	109b72b4cd2e4e2d343573d72ec86efd
+usr/lib/modules/7.1.13/kernel/drivers/power/sequencing/pwrseq-qcom-wcn.ko	22560	dca06b0c0ab83b92a1eaef053f30a868
+usr/lib/modules/7.1.13/kernel/drivers/regulator/wl2864c-regulator.ko	16904	66cd61a63bea3c4312b8a370a6b3b8ac
+usr/lib/modules/7.1.13/kernel/drivers/soc/qcom/m52xq-icp.ko	38848	889dc2439b0710831192915581d15d6b
+usr/lib/modules/7.1.13/kernel/net/ipv4/ip_tunnel.ko	35544	c33778add9792b6a9464de3e527bbfe5
+usr/lib/modules/7.1.13/kernel/net/ipv4/tunnel4.ko	10216	af511184279afc8128574103ee245e1f
+usr/lib/modules/7.1.13/kernel/net/ipv6/sit.ko	37552	fad890a4728ee478b5a47656fce197c0
+usr/lib/modules/7.1.13/modules.alias.bin	2942	866975fef30fd157fe4bfe01b192201b
+usr/lib/modules/7.1.13/modules.builtin.alias.bin	45804	1b2d9efea2cc697f9b7308f1bd6bc2c7
+usr/lib/modules/7.1.13/modules.builtin.bin	21227	de4fb9f4371dfb73583d10c9c3a698ee
+usr/lib/modules/7.1.13/modules.builtin.modinfo	292736	5e05212522923ad23766c36f7ef9be2f
+usr/lib/modules/7.1.13/modules.dep.bin	2122	65e1081608cbca1b3c07a275350e5241
+usr/lib/modules/7.1.13/modules.symbols.bin	7560	46c3f94f0e166e2dc2af7c8596193460
+usr/share/i18n/locales/musl/ar_SA.UTF-8	98	4b378a07f7b2a13146b21bbdf1b48ec9
+usr/share/i18n/locales/musl/hi_IN.UTF-8	98	4b378a07f7b2a13146b21bbdf1b48ec9
+usr/share/i18n/locales/musl/ja_JP.UTF-8	98	4b378a07f7b2a13146b21bbdf1b48ec9
+usr/share/i18n/locales/musl/ko_KR.UTF-8	98	4b378a07f7b2a13146b21bbdf1b48ec9
+usr/share/i18n/locales/musl/zh_CN.UTF-8	98	4b378a07f7b2a13146b21bbdf1b48ec9

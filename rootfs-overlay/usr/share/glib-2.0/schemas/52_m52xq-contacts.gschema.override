@@ -1,0 +1,8 @@
+# M52XQ (Phosh): the main address book is chosen by default, so GNOME Contacts skips its first-run setup and
+# Calls shows "Add contact" in the call history at once (without a main address book Contacts does not export
+# the action that Calls needs).
+[org.gnome.Contacts]
+did-initial-setup=true
+
+[org.freedesktop.folks]
+primary-store='eds:system-address-book'

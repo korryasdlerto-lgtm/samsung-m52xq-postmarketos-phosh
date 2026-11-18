@@ -1,0 +1,117 @@
+--- a/src/calls-call-window.c
++++ b/src/calls-call-window.c
+@@ -50,6 +50,7 @@
+   GtkStack               *main_stack;
+   GtkStack               *header_bar_stack;
+   GtkButton              *show_calls;
++  GtkButton              *swap_calls;
+   GtkStack               *call_stack;
+   GtkFlowBox             *call_selector;
+ 
+@@ -82,6 +83,61 @@
+ }
+ 
+ 
++/* m52xq: "Swap": put the active call on hold (HoldAndAccept of the modem swaps the active and the held call) */
++static void
++update_swap_button (CallsCallWindow *self)
++{
++  guint n = g_list_model_get_n_items (G_LIST_MODEL (self->calls));
++  gboolean can_swap = FALSE;
++
++  for (guint i = 0; i < n; i++) {
++    g_autoptr (CallsCallSelectorItem) item = g_list_model_get_item (G_LIST_MODEL (self->calls), i);
++    CuiCall *call = cui_call_display_get_call (calls_call_selector_item_get_display (item));
++    CuiCallState state = cui_call_get_state (call);
++
++    if (state == CUI_CALL_STATE_ACTIVE || state == CUI_CALL_STATE_HELD)
++      can_swap = TRUE;
++  }
++
++  gtk_widget_set_visible (GTK_WIDGET (self->swap_calls), n > 1);
++  gtk_widget_set_sensitive (GTK_WIDGET (self->swap_calls), n > 1 && can_swap);
++}
++
++
++static void
++swap_calls_clicked_cb (GtkButton       *button,
++                       CallsCallWindow *self)
++{
++  guint n = g_list_model_get_n_items (G_LIST_MODEL (self->calls));
++  CuiCall *held = NULL;
++
++  for (guint i = 0; i < n; i++) {
++    g_autoptr (CallsCallSelectorItem) item = g_list_model_get_item (G_LIST_MODEL (self->calls), i);
++    CuiCall *call = cui_call_display_get_call (calls_call_selector_item_get_display (item));
++    CuiCallState state = cui_call_get_state (call);
++
++    if (state == CUI_CALL_STATE_ACTIVE && cui_call_get_can_hold (call)) {
++      cui_call_hold (call, TRUE);   /* the held call becomes active */
++      return;
++    }
++    if (state == CUI_CALL_STATE_HELD && !held)
++      held = call;
++  }
++
++  if (held && cui_call_get_can_hold (held))
++    cui_call_hold (held, FALSE);
++}
++
++
++static void
++on_call_state_changed_swap (CuiCall         *call,
++                            GParamSpec      *pspec,
++                            CallsCallWindow *self)
++{
++  update_swap_button (self);
++}
++
++
+ static void
+ update_visibility (CallsCallWindow *self)
+ {
+@@ -95,6 +151,7 @@
+   else if (calls == 1)
+     gtk_stack_set_visible_child_name (self->main_stack, "active-call");
+ 
++  update_swap_button (self);
+   session_inhibit (self, !!calls);
+ }
+ 
+@@ -169,6 +226,7 @@
+                        cui_call_get_id (call));
+ 
+   g_list_store_append (self->calls, item);
++  g_signal_connect (call, "notify::state", G_CALLBACK (on_call_state_changed_swap), self);
+ 
+   update_visibility (self);
+   set_focus (self, display);
+@@ -345,10 +403,12 @@
+   gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, main_stack);
+   gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, header_bar_stack);
+   gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, show_calls);
++  gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, swap_calls);
+   gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, call_stack);
+   gtk_widget_class_bind_template_child (widget_class, CallsCallWindow, call_selector);
+   gtk_widget_class_bind_template_callback (widget_class, call_selector_child_activated_cb);
+   gtk_widget_class_bind_template_callback (widget_class, show_calls_clicked_cb);
++  gtk_widget_class_bind_template_callback (widget_class, swap_calls_clicked_cb);
+ }
+ 
+ 
+--- a/src/ui/call-window.ui
++++ b/src/ui/call-window.ui
+@@ -64,6 +64,13 @@
+                     <signal name="clicked" handler="show_calls_clicked_cb" swapped="no"/>
+                   </object>
+                 </child>
++                <child>
++                  <object class="GtkButton" id="swap_calls">
++                    <property name="label" translatable="yes">Swap</property>
++                    <property name="visible">False</property>
++                    <signal name="clicked" handler="swap_calls_clicked_cb" swapped="no"/>
++                  </object>
++                </child>
+               </object>
+             </property>
+           </object>

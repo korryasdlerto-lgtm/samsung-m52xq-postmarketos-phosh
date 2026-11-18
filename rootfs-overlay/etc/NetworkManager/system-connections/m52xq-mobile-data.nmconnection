@@ -1,0 +1,21 @@
+# M52XQ: mobile data over IPA (rmnet on the QRTR modem). The SIM manager and the Phosh data tile need a gsm connection;
+# m52xq-sim-mode rebinds interface-name to qrtr0-sim2 when SIM 2 is the data SIM. APN "internet" (Kyivstar / lifecell);
+# lifecell refuses IPv6 ("IPv4 only allowed"), so IPv6 is off. Manual (no autoconnect), as chosen by the user (2026-11-12).
+[connection]
+id=Mobile data
+uuid=c24298d0-34e1-47ff-9839-f18be848d704
+type=gsm
+autoconnect=false
+interface-name=qrtr0
+
+[gsm]
+apn=internet
+
+[ipv4]
+method=auto
+
+[ipv6]
+addr-gen-mode=default
+method=disabled
+
+[proxy]

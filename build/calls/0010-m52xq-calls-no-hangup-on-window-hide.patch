@@ -1,0 +1,79 @@
+diff --git a/plugins/provider/mm/calls-mm-origin.c b/plugins/provider/mm/calls-mm-origin.c
+index 808ba4f..ae53ba0 100644
+--- a/plugins/provider/mm/calls-mm-origin.c
++++ b/plugins/provider/mm/calls-mm-origin.c
+@@ -395,6 +395,9 @@ remove_calls (CallsMMOrigin *self, const char *reason)
+ 
+   paths = g_hash_table_get_keys (self->calls);
+ 
++  if (paths)
++    g_message ("m52xq: origin %s goes away, removing its %u calls", self->name ? self->name : "?", g_list_length (paths));
++
+   for (GList *node = paths; node != NULL; node = node->next) {
+     g_hash_table_steal_extended (self->calls, node->data, NULL, &call);
+     g_signal_emit_by_name (self, "call-removed",
+@@ -598,7 +601,7 @@ call_deleted_cb (MMModemVoice *voice,
+   g_assert (CALLS_IS_MM_ORIGIN (user_data));
+   self = CALLS_MM_ORIGIN (user_data);
+ 
+-  g_debug ("Removing call `%s'", path);
++  g_message ("m52xq: ModemManager deleted call `%s'", path);
+ 
+   g_hash_table_steal_extended (self->calls, path, &key, &call);
+ 
+diff --git a/plugins/provider/mm/calls-mm-provider.c b/plugins/provider/mm/calls-mm-provider.c
+index 2264acb..3fe6847 100644
+--- a/plugins/provider/mm/calls-mm-provider.c
++++ b/plugins/provider/mm/calls-mm-provider.c
+@@ -207,8 +207,8 @@ interface_removed_cb (CallsMMProvider *self,
+   path = g_dbus_object_get_object_path (object);
+   info = g_dbus_interface_get_info (interface);
+ 
+-  g_debug ("ModemManager interface `%s' removed on object `%s'",
+-           info->name, path);
++  g_message ("m52xq: ModemManager interface `%s' removed on object `%s'",
++             info->name, path);
+ 
+   if (g_strcmp0 (info->name,
+                  "org.freedesktop.ModemManager1.Modem.Voice") == 0) {
+@@ -264,7 +264,7 @@ object_removed_cb (CallsMMProvider *self,
+   const gchar *path;
+ 
+   path = g_dbus_object_get_object_path (object);
+-  g_debug ("ModemManager object `%s' removed", path);
++  g_message ("m52xq: ModemManager object `%s' removed", path);
+ 
+   remove_modem_object (self, path, object);
+ }
+@@ -331,7 +331,7 @@ mm_vanished_cb (GDBusConnection *connection,
+                 const gchar     *name,
+                 CallsMMProvider *self)
+ {
+-  g_debug ("ModemManager vanished from D-Bus");
++  g_message ("m52xq: ModemManager vanished from D-Bus");
+ 
+   g_clear_object (&self->mm);
+ 
+diff --git a/src/calls-application.c b/src/calls-application.c
+index 2e579d5..2f11bd0 100644
+--- a/src/calls-application.c
++++ b/src/calls-application.c
+@@ -633,9 +633,15 @@ notify_window_visible_cb (GtkWidget        *window,
+   g_return_if_fail (CALLS_IS_APPLICATION (application));
+   g_return_if_fail (CALLS_IS_CALL_WINDOW (window));
+ 
+-  /* The UI is being closed, hang up active calls */
+-  if (!gtk_widget_is_visible (window))
+-    calls_manager_hang_up_all_calls (manager);
++  /* m52xq: the call window is hidden when its last call goes away; hanging up "all calls" at that moment crashed
++   * (SIGSEGV in calls_manager_hang_up_all_calls on a call that was being removed, 2026-11-14, incoming call after a
++   * resume). On the phone the window is never closed by the user while a call is running, so nothing is hung up here. */
++  if (!gtk_widget_is_visible (window)) {
++    GList *calls = calls_manager_get_calls (manager);
++
++    g_message ("m52xq: call window hidden (%u calls left), not hanging up", g_list_length (calls));
++    g_list_free (calls);
++  }
+ }
+ 
+ 

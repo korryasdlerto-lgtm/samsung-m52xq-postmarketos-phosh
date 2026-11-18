@@ -1,0 +1,94 @@
+#!/usr/bin/python3
+# M52XQ (дроидиан/постмаркет, Phosh): screenshot with Volume Up + Volume Down pressed together, as in the Lomiri port.
+# Phosh has no such key combination. This root service reads only the two volume key devices (pmic_resin = Volume Down,
+# gpio-keys = Volume Up; read-only, no grab: the keys keep changing the volume) and, when both are down at the same
+# time, asks Phosh for a screenshot through org.gnome.Shell.Screenshot on the session bus of the user who runs Phosh.
+# The file goes to ~/Pictures/Screenshots/Screenshot_YYYYmmdd_HHMMSS.png, owned by that user.
+import glob
+import os
+import pwd
+import select
+import struct
+import subprocess
+import time
+
+KEY_VOLUMEDOWN, KEY_VOLUMEUP = 114, 115
+EV_KEY = 1
+EVENT = struct.Struct('qqHHi')
+NAMES = ('pmic_resin', 'gpio-keys')
+
+
+def log(msg):
+	print('m52xq-vol-screenshot: ' + msg, flush=True)
+
+
+def open_devices():
+	fds = []
+	for ev in sorted(glob.glob('/sys/class/input/event*')):
+		try:
+			name = open(ev + '/device/name').read().strip()
+		except OSError:
+			continue
+		if name in NAMES:
+			fds.append(os.open('/dev/input/' + os.path.basename(ev), os.O_RDONLY | os.O_NONBLOCK))
+	return fds
+
+
+def phosh_user():
+	for p in glob.glob('/proc/[0-9]*/cmdline'):
+		try:
+			if open(p, 'rb').read().split(b'\0')[0] == b'/usr/libexec/phosh':
+				return os.stat(os.path.dirname(p)).st_uid
+		except OSError:
+			pass
+	return None
+
+
+def screenshot():
+	uid = phosh_user()
+	if uid is None:
+		log('phosh is not running, no screenshot')
+		return
+	pw = pwd.getpwuid(uid)
+	folder = os.path.join(pw.pw_dir, 'Pictures', 'Screenshots')
+	path = os.path.join(folder, time.strftime('Screenshot_%Y%m%d_%H%M%S.png'))
+	env = {'XDG_RUNTIME_DIR': '/run/user/%d' % uid, 'DBUS_SESSION_BUS_ADDRESS': 'unix:path=/run/user/%d/bus' % uid,
+	       'HOME': pw.pw_dir, 'PATH': '/usr/bin:/bin'}
+	try:
+		subprocess.run(['mkdir', '-p', folder], user=uid, group=pw.pw_gid, env=env, timeout=10, check=True)
+		r = subprocess.run(['gdbus', 'call', '--session', '--dest', 'org.gnome.Shell.Screenshot',
+		                    '--object-path', '/org/gnome/Shell/Screenshot',
+		                    '--method', 'org.gnome.Shell.Screenshot.Screenshot', 'false', 'true', path],
+		                   user=uid, group=pw.pw_gid, env=env, timeout=20, capture_output=True, text=True)
+		log('screenshot %s: %s' % (path, (r.stdout or r.stderr).strip()))
+	except (OSError, subprocess.SubprocessError) as e:
+		log('screenshot failed: %s' % e)
+
+
+def main():
+	fds = open_devices()
+	if len(fds) < 2:
+		log('volume key devices not found (%d of 2)' % len(fds))
+	down = {KEY_VOLUMEDOWN: False, KEY_VOLUMEUP: False}
+	fired = False
+	while True:
+		ready, _, _ = select.select(fds, [], [])
+		for fd in ready:
+			try:
+				data = os.read(fd, EVENT.size * 64)
+			except BlockingIOError:
+				continue
+			for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+				_, _, etype, code, value = EVENT.unpack_from(data, off)
+				if etype != EV_KEY or code not in down:
+					continue
+				down[code] = value != 0	# 1 press, 2 autorepeat, 0 release
+				if all(down.values()):
+					if not fired:
+						fired = True
+						screenshot()
+				elif not any(down.values()):
+					fired = False	# one screenshot per chord
+
+
+main()

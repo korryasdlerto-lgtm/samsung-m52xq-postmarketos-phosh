@@ -1,0 +1,33 @@
+#!/bin/sh
+# m52xq (pmOS Phosh, 2026-11-14): during a Telegram call switch its sound between the loud speaker and the earpiece (both are the
+# same PulseAudio sink, m52xq-audio-route switches the codec mixers; m52xq-voip-audio keeps a choice made by hand until the
+# call is over). Only during a call (the user: "block it outside a Telegram call"): Telegram plays AND records = a call.
+# Outside a call it does nothing (and puts a forgotten earpiece back on the loud speaker).
+export PULSE_SERVER=unix:/run/user/$(id -u)/pulse/native
+ru=0; case "${LANG:-}" in ru*) ru=1 ;; esac
+msg() { [ $ru = 1 ] && t="$2" || t="$1"; notify-send -a "Speakerphone" -i audio-speakers-symbolic -t 2500 "$t"; }
+si=0; so=0
+pactl list sink-inputs 2>/dev/null | grep -qE 'application.name = "(Telegram|Telegram Desktop)"' && si=1
+pactl list source-outputs 2>/dev/null | grep -qE 'application.name = "(Telegram|Telegram Desktop)"' && so=1
+if [ $si = 0 ] || [ $so = 0 ]; then
+	[ "$(/usr/local/bin/m52xq-audio-route status 2>/dev/null)" = earpiece ] && /usr/local/bin/m52xq-audio-route speaker >/dev/null
+	msg "Only during a Telegram call" "Только во время звонка Telegram"
+	exit 0
+fi
+# m52xq r2 (2026-11-17): with a USB headset plugged the button also reaches it: earpiece -> loud speaker -> USB headset ->
+# earpiece (before, it only swapped earpiece and loud speaker and took the sound away from the headset)
+usb=$(pactl list short sinks 2>/dev/null | awk '$2 ~ /^alsa_output\.usb-/ {print $2; exit}')
+# r3: Bluetooth headphones the same way (USB first when both are there)
+bt=$(pactl list short sinks 2>/dev/null | awk '$2 ~ /^bluez_(sink|output)\./ {print $2; exit}')
+case "$(/usr/local/bin/m52xq-audio-route status 2>/dev/null)" in
+earpiece) r=$(/usr/local/bin/m52xq-audio-route speaker) ;;
+speaker) if [ -n "$usb" ]; then /usr/local/bin/m52xq-audio-route usb >/dev/null && r=usb; elif [ -n "$bt" ]; then /usr/local/bin/m52xq-audio-route bt >/dev/null && r=bt; else r=$(/usr/local/bin/m52xq-audio-route earpiece); fi ;;
+*) r=$(/usr/local/bin/m52xq-audio-route earpiece) ;;
+esac
+case "$r" in
+speaker) msg "Loud speaker" "Громкий динамик" ;;
+earpiece) msg "Earpiece" "Разговорный динамик" ;;
+usb) msg "USB headset" "USB-гарнитура" ;;
+bt) msg "Bluetooth headphones" "Наушники Bluetooth" ;;
+*) msg "$r" "$r" ;;
+esac

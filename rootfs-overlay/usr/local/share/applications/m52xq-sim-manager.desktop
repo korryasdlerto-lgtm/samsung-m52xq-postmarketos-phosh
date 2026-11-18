@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SIM cards manager
+Name[ru]=Менеджер SIM-карт
+Comment=Both SIM cards or only one, SIM of the mobile data, mobile data on/off
+Comment[ru]=Обе SIM-карты или одна, SIM мобильных данных, мобильные данные вкл/выкл
+Icon=network-cellular-symbolic
+Exec=/usr/local/bin/m52xq-sim-manager
+Terminal=false
+Categories=System;Settings;
+Keywords=sim;dual;dsds;modem;data;сим;
+X-Purism-FormFactor=Workstation;Mobile;
