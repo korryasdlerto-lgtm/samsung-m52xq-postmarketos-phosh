@@ -10,7 +10,7 @@ same as in the sister ports [samsung-m52xq-mainline](https://github.com/korryasd
 `samsung-m52xq-postmarketos-lomiri`. Personal, unofficial project (not a postmarketOS release), tested on one SM-M526B.
 
 **Status (release "unofficial v1", 2026-11-18, see [changes](docs/CHANGES-v1.md) / [на русском](docs/CHANGES-v1-RU.md)):
-a daily-usable Linux phone.** It has calls, SMS and mobile data on two SIMs, Wi-Fi, Bluetooth, a GPU-accelerated Phosh,
+usable, but not yet ready as your only phone.** It has calls, SMS and mobile data on two SIMs, Wi-Fi, Bluetooth, a GPU-accelerated Phosh,
 sound, GPS, sensors, all four cameras with 64 MP photos and hardware-encoded 4K video, and deep sleep that wakes for calls,
 SMS and alarms.
 
@@ -64,6 +64,7 @@ Requirements: unlocked bootloader, TWRP for m52xq
 (adb push in TWRP) or on a microSD card, backups of EFS, persist, modem, boot, vendor_boot and vbmeta. If you are not
 comfortable restoring a Samsung phone with Odin, do not install this.
 
+- Video guide: <https://www.youtube.com/watch?v=F3BdpIiWePo> (switching from another Linux port, so UN1CA is not flashed there)
 - Flashable zip (0.9 GB): [postmarketos-phosh-m52xq-mainline-v1-UNOFFICIAL.zip](https://drive.google.com/file/d/1j3U80MAcUWkaXCpt41vcyFUClD5SpIIp/view?usp=sharing), md5 `946280ae620d3f04feb7e25a009fb492`
 
 The phone gets warm during the install. If your display already shows vertical coloured lines, do not install this: the
@@ -94,6 +95,8 @@ ID are created on the first boot.
 - Reboot into recovery: app "Reboot menu" - "Reboot into recovery".
 
 ### Back to Android
+
+Video guide: <https://www.youtube.com/watch?v=0lgLbtdl4rA&t=89s>
 
 Enter TWRP (app "Reboot menu" - "Reboot into recovery", or the power and volume button combination). Copy the firmware zip to
 the microSD card first. The LineageOS and UN1CA zips rewrite boot, vendor_boot and dtbo themselves.
